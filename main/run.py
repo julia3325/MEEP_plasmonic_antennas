@@ -7,29 +7,24 @@ def run():
     meep.Simulation.eps_averaging = False
     
     # default values
-    mode = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    material_name = sys.argv[2] if len(sys.argv) > 2 else "air"
+    # mode = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    # material_name = sys.argv[2] if len(sys.argv) > 2 else "air"
+    mode = 4
 
     if mode == 1:
-        bowtie_substrate_experiment(material_name)
+        calculate_resonant_peaks()
 
     elif mode == 2:
-        bowtie_substrate_experiment_LT(material_name)
+        bowtie_AuTiSiO2_opt()
 
     elif mode == 3:
-        bowtie_substrate_experiment_MIR(material_name)
+        hybridbar_calculate_resonant_peaks()
 
     elif mode == 4:
-        bowtie_substrate_ONLY_experiment(material_name)
-
-    elif mode == 5:
-        after_hpc_redraw(material_name)
-
-    elif mode == 6:
-        bowtie_big_substrate_experiment(material_name)
+        hybridbar_AuTiSiO2_opt()
     
     else:
-        print("Invalid mode. Please choose a mode between 1 and 6.")
+        print("Invalid mode. Please choose a mode between 1 and 2.")
 
 if __name__ == "__main__":
     run()
