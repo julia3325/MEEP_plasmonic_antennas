@@ -26,6 +26,36 @@ def _get_mpi_comm():
     except ImportError:
         return None, None
 
+def _pick_resonance_idx(spectrum, edge_guard=2):
+    """
+    Pick the wavelength of MAXIMUM in-band enhancement.
+
+    The scan window (5700-10300 nm) is the tuning range of the laser used
+    in the lab, so the quantity of interest is the best enhancement
+    ACHIEVABLE within that band - not the vacuum resonance position. Hence
+    a plain argmax over the window: if the spectrum peaks inside, that is
+    the resonance; if it rises monotonically to an edge, the edge value is
+    the best the laser can reach and is a valid (if sub-optimal) result.
+
+    `edge_guard` only trims a couple of outermost points to reject pure DFT
+    edge spikes (very low source SNR at the extreme frequencies). The
+    returned `at_boundary` flag marks geometries whose true resonance lies
+    outside the band (best point sits at the window edge) - useful because
+    those geometries are not ideally matched to the laser.
+
+    Returns
+    -------
+    (idx, at_boundary) : (int, bool)
+    """
+    n = len(spectrum)
+    g = min(edge_guard, n // 2)
+    lo, hi = g, n - g  # search range [lo, hi)
+
+    idx = int(np.argmax(spectrum[lo:hi]) + lo)
+    # flag if the chosen point is at (or right next to) either window edge
+    at_boundary = (idx <= lo + 1) or (idx >= hi - 2)
+    return idx, at_boundary
+
 def _dft_gap_spectra(sim, dft_box, dft_inner, dft_center, nfreq, comm, MPI):
     """
     Extract three Ex spectra from the gap DFT regions:
@@ -222,15 +252,18 @@ def hybridbar_calculate_resonant_peaks():
             fef_mean = ant_mean / (empty_mean + eps)             # gap-averaged intensity
             fef_center = ant_center**2 / (empty_center**2 + eps) # gap centre point
 
-            # peak selected from the gap-averaged spectrum (robust w.r.t.
-            # staircase singularities at metal corners)
-            best_idx = np.argmax(fef_mean)
+            # peak POSITION from the gap-centre spectrum: it tracks the
+            # dipolar gap resonance cleanly, unlike the gap-averaged one
+            # whose rising short-wavelength background pushes argmax to the
+            # window edge. Interior local-max search avoids boundary pinning.
+            best_idx, at_boundary = _pick_resonance_idx(fef_center)
             best_freq = freqs[best_idx]
             best_wavelength_nm = (1.0 / best_freq) * xm
+            warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
                   f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
                   f"FEF_center = {fef_center[best_idx]:.2f}, "
-                  f"FEF_max_px = {fef_max[best_idx]:.2f})")
+                  f"FEF_max_px = {fef_max[best_idx]:.2f}){warn}")
 
             import matplotlib.pyplot as plt
 
@@ -238,9 +271,9 @@ def hybridbar_calculate_resonant_peaks():
 
             plt.figure(figsize=(8, 5))
             plt.semilogy(wavelengths_nm, fef_mean, '-', color='darkred', linewidth=2, label='FEF mean (gap)')
-            plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre')
+            plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre (peak pick)')
             plt.semilogy(wavelengths_nm, fef_max, '--', color='gray', linewidth=1.5, label='FEF max pixel')
-            plt.plot(best_wavelength_nm, fef_mean[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
+            plt.plot(best_wavelength_nm, fef_center[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
 
             plt.xlabel('Wavelength [nm]', fontsize=14)
             plt.ylabel('Field Enhancement Factor (FEF)', fontsize=14)
@@ -635,15 +668,18 @@ def bowtie_calculate_resonant_peaks():
             fef_mean = ant_mean / (empty_mean + eps)             # gap-averaged intensity
             fef_center = ant_center**2 / (empty_center**2 + eps) # gap centre point
 
-            # peak selected from the gap-averaged spectrum (robust w.r.t.
-            # staircase singularities at metal corners)
-            best_idx = np.argmax(fef_mean)
+            # peak POSITION from the gap-centre spectrum: it tracks the
+            # dipolar gap resonance cleanly, unlike the gap-averaged one
+            # whose rising short-wavelength background pushes argmax to the
+            # window edge. Interior local-max search avoids boundary pinning.
+            best_idx, at_boundary = _pick_resonance_idx(fef_center)
             best_freq = freqs[best_idx]
             best_wavelength_nm = (1.0 / best_freq) * xm
+            warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
                   f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
                   f"FEF_center = {fef_center[best_idx]:.2f}, "
-                  f"FEF_max_px = {fef_max[best_idx]:.2f})")
+                  f"FEF_max_px = {fef_max[best_idx]:.2f}){warn}")
 
             import matplotlib.pyplot as plt
 
@@ -651,9 +687,9 @@ def bowtie_calculate_resonant_peaks():
 
             plt.figure(figsize=(8, 5))
             plt.semilogy(wavelengths_nm, fef_mean, '-', color='darkred', linewidth=2, label='FEF mean (gap)')
-            plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre')
+            plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre (peak pick)')
             plt.semilogy(wavelengths_nm, fef_max, '--', color='gray', linewidth=1.5, label='FEF max pixel')
-            plt.plot(best_wavelength_nm, fef_mean[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
+            plt.plot(best_wavelength_nm, fef_center[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
 
             plt.xlabel('Wavelength [nm]', fontsize=14)
             plt.ylabel('Field Enhancement Factor (FEF)', fontsize=14)
