@@ -1117,6 +1117,316 @@ def compute_fields(
                 )
     return 0
 
+def compute_dft_enhancement_maps(
+    sim_antenna,
+    sim_empty,
+    volumes,
+    config,
+    decay_tol=1e-6,
+    max_run_time=None,
+    components=(mp.Ex, mp.Ey, mp.Ez),
+    monitor_pt=mp.Vector3(0, 0, 0),
+    monitor_dt=None,
+    make_plots=False,
+):
+    """
+    Compute steady-state (CW) intensity enhancement maps at a single
+    frequency f0 = config.frequency using DFT fields:
+
+        enhancement[r] = sum_i |E_i^ant(r, f0)|^2 / sum_i |E_i^empty(r, f0)|^2
+
+    This is the same quantity as the FEF spectra from the resonance-scan
+    functions (ratio of DFT amplitudes), so the map peak is directly
+    comparable with the FEF value at the resonance wavelength. Unlike the
+    time-domain snapshot maps (animate_enhancement_fields), the result does
+    not depend on the source pulse shape - the spectral envelope cancels in
+    the ratio.
+
+    Both simulations are run with until_after_sources=stop_when_dft_decayed,
+    i.e. until the DFT fields converge (source turn-off + resonance
+    ring-down), capped by max_run_time [Meep time units].
+
+    A lightweight point monitor records Ex(t) at monitor_pt (default: gap
+    centre) in both runs - this replaces the old amplitude-vs-time plots
+    from the full-plane h5 dumps and doubles as a ring-down/convergence
+    diagnostic.
+
+    Outputs (master process only), written to config.path_to_save:
+        dft_enhancement_<plane>_e2.h5   (enhancement, ant_e2, empty_e2, axes)
+        field_vs_time_gap.dat           (Ex(t) at monitor_pt, both runs)
+    and, only when make_plots=True (PNG rendering does not work on the
+    cluster - keep False there and render locally with
+    postprocess_dft_enhancement_maps):
+        dft_enhancement_<plane>_e2.png  (log-scale map)
+        field_vs_time_gap.png
+
+    Returns
+    -------
+    dict {plane_name: max_enhancement} on master, {} on other processes.
+    """
+    freq = config.frequency
+    if monitor_dt is None:
+        monitor_dt = getattr(config, "sim_time_step", 0.05)
+
+    plane_map = {
+        "xyplanar": "XY",
+        "xyplanarTOP": "XY_TOP",
+        "xzplanar": "XZ",
+        "yzplanar": "YZ",
+    }
+
+    dfts_empty = {}
+    dfts_antenna = {}
+    for name, key in plane_map.items():
+        vol = volumes.volume[key]
+        dfts_empty[name] = sim_empty.add_dft_fields(list(components), [freq], where=vol)
+        dfts_antenna[name] = sim_antenna.add_dft_fields(list(components), [freq], where=vol)
+
+    # ============================================================
+    # EMPTY RUN
+    # ============================================================
+    if mp.am_master():
+        print("Running EMPTY simulation (DFT enhancement maps)")
+        append_time_to_file(config, prefix="DFT maps, EMPTY run: ")
+
+    # point monitor Ex(t) - replacement for the old amplitude-vs-time plots
+    t_empty, ex_empty = [], []
+
+    def _record_empty(sim):
+        t_empty.append(sim.meep_time())
+        ex_empty.append(np.real(sim.get_field_point(mp.Ex, monitor_pt)))
+
+    # NOTE: stop_when_dft_decayed returns a stateful closure -> build a
+    # fresh one for each run
+    sim_empty.run(
+        mp.at_every(monitor_dt, _record_empty),
+        until_after_sources=mp.stop_when_dft_decayed(
+            tol=decay_tol, maximum_run_time=max_run_time
+        ))
+
+    if mp.am_master():
+        print(f"EMPTY run finished at t = {sim_empty.meep_time():.1f}")
+
+    empty_e2 = {}
+    for name in plane_map:
+        acc = None
+        for c in components:
+            arr = sim_empty.get_dft_array(dfts_empty[name], c, 0)
+            a2 = np.abs(arr) ** 2
+            acc = a2 if acc is None else acc + a2
+        empty_e2[name] = acc
+
+    # ============================================================
+    # ANTENNA RUN
+    # ============================================================
+    if mp.am_master():
+        print("Running simulation WITH antenna (DFT enhancement maps)")
+        append_time_to_file(config, prefix="DFT maps, ANTENNA run: ")
+
+    t_ant, ex_ant = [], []
+
+    def _record_ant(sim):
+        t_ant.append(sim.meep_time())
+        ex_ant.append(np.real(sim.get_field_point(mp.Ex, monitor_pt)))
+
+    sim_antenna.run(
+        mp.at_every(monitor_dt, _record_ant),
+        until_after_sources=mp.stop_when_dft_decayed(
+            tol=decay_tol, maximum_run_time=max_run_time
+        ))
+
+    if mp.am_master():
+        print(f"ANTENNA run finished at t = {sim_antenna.meep_time():.1f}")
+
+    antenna_e2 = {}
+    coords = {}
+    for name in plane_map:
+        acc = None
+        for c in components:
+            arr = sim_antenna.get_dft_array(dfts_antenna[name], c, 0)
+            a2 = np.abs(arr) ** 2
+            acc = a2 if acc is None else acc + a2
+        antenna_e2[name] = acc
+        # physical coordinates matching the returned array shape
+        # (robust also w.r.t. symmetry-reduced storage)
+        coords[name] = sim_antenna.get_array_metadata(
+            dft_cell=dfts_antenna[name]
+        )[:3]
+
+    # ============================================================
+    # ENHANCEMENT MAPS (master only)
+    # ============================================================
+    results = {}
+    if mp.am_master():
+        eps = 1e-20
+
+        # ---------- Ex(t) at the monitor point (both runs) ----------
+        dat_path = os.path.join(config.path_to_save, "field_vs_time_gap.dat")
+        with open(dat_path, "w") as f:
+            f.write("# t_empty\tEx_empty\tt_antenna\tEx_antenna\n")
+            n_rows = max(len(t_empty), len(t_ant))
+            for i in range(n_rows):
+                te = f"{t_empty[i]:.4f}\t{ex_empty[i]:.6e}" if i < len(t_empty) else "\t"
+                ta = f"{t_ant[i]:.4f}\t{ex_ant[i]:.6e}" if i < len(t_ant) else "\t"
+                f.write(te + "\t" + ta + "\n")
+
+        for name, key in plane_map.items():
+            enh = antenna_e2[name] / (empty_e2[name] + eps)
+            max_enh = float(np.max(enh))
+            results[name] = max_enh
+
+            xs, ys, zs = [np.atleast_1d(np.asarray(c)) for c in coords[name]]
+            if key.startswith("XY"):
+                h_ax, v_ax = xs, ys
+            elif key == "XZ":
+                h_ax, v_ax = xs, zs
+            else:  # YZ
+                h_ax, v_ax = ys, zs
+
+            idx = np.unravel_index(np.argmax(enh), enh.shape)
+            print(
+                f"[{name}] max |E|^2 enhancement = {max_enh:.1f} "
+                f"at ({h_ax[idx[0]]*1e3:.1f}, {v_ax[idx[1]]*1e3:.1f}) nm"
+            )
+
+            h5_path = os.path.join(
+                config.path_to_save, f"dft_enhancement_{name}_e2.h5"
+            )
+            with h5py.File(h5_path, "w") as f:
+                f.create_dataset("enhancement", data=enh)
+                f.create_dataset("ant_e2", data=antenna_e2[name])
+                f.create_dataset("empty_e2", data=empty_e2[name])
+                f.create_dataset("axis_h_um", data=h_ax)
+                f.create_dataset("axis_v_um", data=v_ax)
+                f.attrs["frequency"] = freq
+                f.attrs["wavelength_nm"] = 1e3 / freq
+                f.attrs["plane"] = key
+
+        # PNG rendering does not work on the cluster -> keep make_plots=False
+        # there and render locally with postprocess_dft_enhancement_maps()
+        if make_plots:
+            postprocess_dft_enhancement_maps(config.path_to_save)
+
+    return results
+
+def _plot_dft_map(enh, h_nm, v_nm, xlabel, ylabel, title, save_path):
+    """Render a single log-scale DFT enhancement map to PNG."""
+    from matplotlib.colors import LogNorm
+
+    max_enh = float(np.max(enh))
+    extent = [h_nm[0], h_nm[-1], v_nm[0], v_nm[-1]]
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(
+        enh.T,
+        origin="lower",
+        extent=extent,
+        cmap="inferno",
+        norm=LogNorm(vmin=max(max_enh * 1e-4, 1e-3), vmax=max_enh),
+        aspect="auto",
+    )
+    ax.set_xlabel(xlabel, fontsize=13)
+    ax.set_ylabel(ylabel, fontsize=13)
+    ax.set_title(title, fontsize=13)
+    fig.colorbar(im, ax=ax, label="|E|$^2$ / |E$_0$|$^2$")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+def postprocess_dft_enhancement_maps(load_path, roi_nm=None):
+    """
+    LOCAL postprocessing of the dft_enhancement_<plane>_e2.h5 files produced
+    on the cluster by compute_dft_enhancement_maps (where PNG rendering is
+    disabled). Renders the log-scale PNG maps next to the h5 files and,
+    additionally, the Ex(t) diagnostic plot from field_vs_time_gap.dat.
+
+    Parameters
+    ----------
+    load_path : str
+        Folder with dft_enhancement_*.h5 (a single simulation's results).
+
+    roi_nm : dict or None
+        Optional ROI (in nm) for gap statistics, per plane family, e.g.:
+            {
+                "XY": {"center": (0, 0),  "width": 30, "height": 10},
+                "XZ": {"center": (0, -2.5), "width": 30, "height": 35},
+                "YZ": {"center": (0, -2.5), "width": 10, "height": 35},
+            }
+        For planes with a matching ROI the mean and max enhancement inside
+        the ROI are computed.
+
+    Returns
+    -------
+    dict {plane_name: {"max": ..., "mean_roi": ..., "max_roi": ...}}
+        ("mean_roi"/"max_roi" present only when a ROI was applied)
+    """
+    plane_labels = {
+        "xyplanar":    ("XY", "X [nm]", "Y [nm]"),
+        "xyplanarTOP": ("XY", "X [nm]", "Y [nm]"),
+        "xzplanar":    ("XZ", "X [nm]", "Z [nm]"),
+        "yzplanar":    ("YZ", "Y [nm]", "Z [nm]"),
+    }
+
+    stats = {}
+    for name, (roi_key, xlabel, ylabel) in plane_labels.items():
+        h5_path = os.path.join(load_path, f"dft_enhancement_{name}_e2.h5")
+        if not os.path.exists(h5_path):
+            print(f"[postprocess_dft] missing {h5_path}, skipping")
+            continue
+
+        with h5py.File(h5_path, "r") as f:
+            enh = f["enhancement"][...]
+            h_nm = f["axis_h_um"][...] * 1e3
+            v_nm = f["axis_v_um"][...] * 1e3
+            wavelength_nm = float(f.attrs.get("wavelength_nm", 0.0))
+
+        entry = {"max": float(np.max(enh))}
+
+        if roi_nm is not None and roi_key in roi_nm:
+            r = roi_nm[roi_key]
+            cx, cy = r["center"]
+            hmask = (h_nm >= cx - r["width"] / 2.0) & (h_nm <= cx + r["width"] / 2.0)
+            vmask = (v_nm >= cy - r["height"] / 2.0) & (v_nm <= cy + r["height"] / 2.0)
+            roi_data = enh[np.ix_(hmask, vmask)]
+            if roi_data.size > 0:
+                entry["mean_roi"] = float(np.mean(roi_data))
+                entry["max_roi"] = float(np.max(roi_data))
+
+        _plot_dft_map(
+            enh, h_nm, v_nm, xlabel, ylabel,
+            title=(f"|E|$^2$ enhancement @ {wavelength_nm:.0f} nm "
+                   f"(max = {entry['max']:.0f})"),
+            save_path=os.path.join(load_path, f"dft_enhancement_{name}_e2.png"),
+        )
+        stats[name] = entry
+
+    # Ex(t) diagnostic plot from the point-monitor data
+    dat_path = os.path.join(load_path, "field_vs_time_gap.dat")
+    if os.path.exists(dat_path):
+        t_e, ex_e, t_a, ex_a = [], [], [], []
+        with open(dat_path) as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    t_e.append(float(parts[0])); ex_e.append(float(parts[1]))
+                if len(parts) >= 4 and parts[2] and parts[3]:
+                    t_a.append(float(parts[2])); ex_a.append(float(parts[3]))
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(t_e, ex_e, color="gray", linewidth=1, label="empty")
+        ax.plot(t_a, ex_a, color="darkred", linewidth=1, label="antenna")
+        ax.set_xlabel("t [Meep units]", fontsize=13)
+        ax.set_ylabel("Ex at gap centre", fontsize=13)
+        ax.set_title("Ex(t) at monitor point", fontsize=13)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend(fontsize=11)
+        fig.tight_layout()
+        fig.savefig(os.path.join(load_path, "field_vs_time_gap.png"), dpi=300)
+        plt.close(fig)
+
+    return stats
+
 def get_phys_ranges(bounds, plane):
     if plane == "XY":
         return [bounds["xmin"], bounds["xmax"]], [bounds["ymin"], bounds["ymax"]]

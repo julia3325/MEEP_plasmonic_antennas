@@ -14,6 +14,62 @@ from visualization.plotter import *
 xm = 1000
 mp.Simulation.eps_averaging = False
 
+# DFT convergence settings: run until DFT fields stop changing (source
+# turn-off + resonance ring-down), with a hard cap on total run time
+DFT_DECAY_TOL = 1e-6
+DFT_MAX_RUN_TIME = 800.0  # [Meep time units]
+
+def _get_mpi_comm():
+    try:
+        from mpi4py import MPI
+        return MPI.COMM_WORLD, MPI
+    except ImportError:
+        return None, None
+
+def _dft_gap_spectra(sim, dft_box, dft_inner, dft_center, nfreq, comm, MPI):
+    """
+    Extract three Ex spectra from the gap DFT regions:
+
+        max_amp[i]    - max |Ex| over the full gap box (includes pixels at
+                        the metal walls -> grid-singular, resolution-dependent)
+        mean_int[i]   - mean |Ex|^2 over the inner box (metal-adjacent pixels
+                        excluded -> converges with resolution)
+        center_amp[i] - |Ex| at the gap centre point
+
+    All reductions are MPI-safe whether get_dft_array returns full or
+    chunk-local arrays: max/center use MAX reduction, mean uses SUM of
+    (sum, count) so rank multiplicity cancels.
+    """
+    max_amp = np.zeros(nfreq)
+    mean_int = np.zeros(nfreq)
+    center_amp = np.zeros(nfreq)
+
+    for i in range(nfreq):
+        arr = sim.get_dft_array(dft_box, mp.Ex, i)
+        vmax = float(np.max(np.abs(arr))) if (arr is not None and arr.size > 0) else 0.0
+
+        arr_in = sim.get_dft_array(dft_inner, mp.Ex, i)
+        if arr_in is not None and arr_in.size > 0:
+            s = float(np.sum(np.abs(arr_in) ** 2))
+            n = float(arr_in.size)
+        else:
+            s, n = 0.0, 0.0
+
+        arr_c = sim.get_dft_array(dft_center, mp.Ex, i)
+        vc = float(np.max(np.abs(arr_c))) if (arr_c is not None and arr_c.size > 0) else 0.0
+
+        if comm is not None:
+            vmax = comm.allreduce(vmax, op=MPI.MAX)
+            s = comm.allreduce(s, op=MPI.SUM)
+            n = comm.allreduce(n, op=MPI.SUM)
+            vc = comm.allreduce(vc, op=MPI.MAX)
+
+        max_amp[i] = vmax
+        mean_int[i] = s / n if n > 0 else 0.0
+        center_amp[i] = vc
+
+    return max_amp, mean_int, center_amp
+
 def hybridbar_calculate_resonant_peaks():
     config = SimulationConfig()
 
@@ -29,9 +85,11 @@ def hybridbar_calculate_resonant_peaks():
     center_wavelength_nm = (1.0 / fcen) * xm  # około 7338.7 nm
     nfreq = 200
 
-    config.resolution = 350                   
+    config.resolution = 350
     config.lambda0 = center_wavelength_nm / xm
-    config.frequency_width = df * config.lambda0                             
+    # fwidth in Meep frequency units, slightly wider than the scanned band;
+    # the spectral envelope cancels in the ant/empty DFT ratio anyway
+    config.frequency_width = 1.5 * df
 
     sweeps = [
         # {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 240},
@@ -50,7 +108,7 @@ def hybridbar_calculate_resonant_peaks():
         
     if mp.am_master():
         with open(results_filename, "w") as f:
-            f.write("Geometria\tGap[nm]\tL_bar[nm]\tL_tip[nm]\tW[nm]\tResonant_Wavelength[nm]\tMax_FEF\n")
+            f.write("Geometria\tGap[nm]\tL_bar[nm]\tL_tip[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
 
     freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
 
@@ -115,81 +173,89 @@ def hybridbar_calculate_resonant_peaks():
         config.src_size = [L_Sub, W_Sub, 0.0]
         config.src_center = [0.0, 0.0, config.cell_size[2]/2.0 - 1.15*config.pml]
 
-        try:
-            from mpi4py import MPI
-            comm = MPI.COMM_WORLD
-        except ImportError:
-            comm = None
+        comm, MPI = _get_mpi_comm()
 
-        dft_size = mp.Vector3(gap, 10/xm, 10/xm) 
+        # full gap box (touches the metal walls at x = +-gap/2)
+        dft_size = mp.Vector3(gap, 10/xm, 10/xm)
+        # inner box: exclude ~2 pixels next to each metal wall, where the
+        # discretized corner fields are singular and do not converge
+        inner_gap = max(gap - 4.0/config.resolution, 0.4*gap)
+        dft_size_inner = mp.Vector3(inner_gap, 10/xm, 10/xm)
 
         sim_empty = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=[], sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
 
         dft_empty = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
-        
-        sim_empty.run(until=15000 / xm)
-        
-        empty_data = []
-        for i in range(nfreq):
-            arr = sim_empty.get_dft_array(dft_empty, mp.Ex, i)
-            val = np.max(np.abs(arr)) if (arr is not None and arr.size > 0) else 0.0
-            
-            if comm is not None:
-                val = comm.allreduce(val, op=MPI.MAX)
-            empty_data.append(val)
-        empty_data = np.array(empty_data)
-        
+        dft_empty_in = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
+        dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+
+        # run until the DFT fields converge (pulse + ring-down), instead of
+        # a fixed time shorter than the source itself
+        sim_empty.run(until_after_sources=mp.stop_when_dft_decayed(
+            tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
+        if mp.am_master():
+            print(f"EMPTY run finished at t = {sim_empty.meep_time():.1f}")
+
+        empty_max, empty_mean, empty_center = _dft_gap_spectra(
+            sim_empty, dft_empty, dft_empty_in, dft_empty_c, nfreq, comm, MPI)
+
         sim_empty.reset_meep()
 
         sim = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=geometry, sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
-        
+
         dft_ant = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
-        
-        sim.run(until=15000 / xm)
-        
-        ant_data = []
-        for i in range(nfreq):
-            arr = sim.get_dft_array(dft_ant, mp.Ex, i)
-            val = np.max(np.abs(arr)) if (arr is not None and arr.size > 0) else 0.0
-            
-            if comm is not None:
-                val = comm.allreduce(val, op=MPI.MAX)
-            ant_data.append(val)
-        ant_data = np.array(ant_data)
-        
+        dft_ant_in = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
+        dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+
+        sim.run(until_after_sources=mp.stop_when_dft_decayed(
+            tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
+        if mp.am_master():
+            print(f"ANTENNA run finished at t = {sim.meep_time():.1f}")
+
+        ant_max, ant_mean, ant_center = _dft_gap_spectra(
+            sim, dft_ant, dft_ant_in, dft_ant_c, nfreq, comm, MPI)
+
         sim.reset_meep()
 
         if mp.am_master():
-            fef_spectrum = np.abs(ant_data)**2 / (np.abs(empty_data)**2 + 1e-16)
-            best_idx = np.argmax(fef_spectrum)
-            best_freq = freqs[best_idx]
-            max_fef = fef_spectrum[best_idx]
-            best_wavelength_nm = (1.0 / best_freq) * xm
-            print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm (Max FEF = {max_fef:.2f})")
+            eps = 1e-16
+            fef_max = ant_max**2 / (empty_max**2 + eps)          # hottest pixel (grid-singular)
+            fef_mean = ant_mean / (empty_mean + eps)             # gap-averaged intensity
+            fef_center = ant_center**2 / (empty_center**2 + eps) # gap centre point
 
+            # peak selected from the gap-averaged spectrum (robust w.r.t.
+            # staircase singularities at metal corners)
+            best_idx = np.argmax(fef_mean)
+            best_freq = freqs[best_idx]
+            best_wavelength_nm = (1.0 / best_freq) * xm
+            print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
+                  f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
+                  f"FEF_center = {fef_center[best_idx]:.2f}, "
+                  f"FEF_max_px = {fef_max[best_idx]:.2f})")
 
             import matplotlib.pyplot as plt
-            
+
             wavelengths_nm = (1.0 / freqs) * xm
-            
+
             plt.figure(figsize=(8, 5))
-            plt.plot(wavelengths_nm, fef_spectrum, '-', color='darkred', linewidth=2, label='FEF Spectrum')
-            plt.plot(best_wavelength_nm, max_fef, 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
-            
+            plt.semilogy(wavelengths_nm, fef_mean, '-', color='darkred', linewidth=2, label='FEF mean (gap)')
+            plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre')
+            plt.semilogy(wavelengths_nm, fef_max, '--', color='gray', linewidth=1.5, label='FEF max pixel')
+            plt.plot(best_wavelength_nm, fef_mean[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
+
             plt.xlabel('Wavelength [nm]', fontsize=14)
             plt.ylabel('Field Enhancement Factor (FEF)', fontsize=14)
             plt.title(f'Resonance Spectrum: L_bar {p["L_bar"]} nm, L_tip {p["L_tip"]} nm, width {p["W"]} nm', fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.7)
             plt.legend(fontsize=12)
             plt.tight_layout()
-            
+
             plot_filename = os.path.join("results", f"spectrum_gap_{p['gap']}nm_Lbar_{p['L_bar']}nm_Ltip_{p['L_tip']}nm_W_{p['W']}nm.png")
             plt.savefig(plot_filename, dpi=300)
             plt.close()
             print(f"Zapisano wykres widma: {plot_filename}")
 
             with open(results_filename, "a") as f:
-                f.write(f"{p['name']}\t{p['gap']}\t{p['L_bar']}\t{p['L_tip']}\t{p['W']}\t{best_wavelength_nm:.2f}\t{max_fef:.2f}\n")
+                f.write(f"{p['name']}\t{p['gap']}\t{p['L_bar']}\t{p['L_tip']}\t{p['W']}\t{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}\n")
 
     if mp.am_master():
         print_task(5, f" Wyniki zapisano w {results_filename}")
@@ -215,10 +281,13 @@ def hybridbar_AuTiSiO2_opt():
         plt.close('all')
 
         config.resolution = 350
-        config.sim_time = 12000 / xm
+        config.sim_time = 12000 / xm      # unused by DFT maps (kept for other utils)
         config.sim_time_step = 50 / xm
         config.lambda0 = p["Wavelength"] / xm
-        config.frequency_width = 1.0
+        # moderate-bandwidth Gaussian pulse centred at the resonance; the
+        # spectral envelope cancels in the DFT ant/empty ratio, so this only
+        # sets the pulse duration (~10/fwidth), not the physics
+        config.frequency_width = config.frequency
         gap = p["gap"]
         L_bar = p["L_bar"]/xm
         L_tip = p["L_tip"]/xm
@@ -361,93 +430,56 @@ def hybridbar_AuTiSiO2_opt():
                 IMG_CLOSE=config.IMG_CLOSE
             )
         # =====================================================
-        print_task(3, "3D calculations.")
-        compute_fields(
-            sim, 
-            sim_empty, 
-            antenna_vols, 
-            config, 
-            fluxes = False,
-            scattering = False,
-            dft_gap_spectrum = False,
-            harminv = False,
-            scattering_antenna=AuTop
+        print_task(3, "3D calculations - DFT enhancement maps at resonance.")
+        # steady-state |E|^2 enhancement maps at lambda0, directly comparable
+        # with the FEF values from hybridbar_calculate_resonant_peaks()
+        max_enh = compute_dft_enhancement_maps(
+            sim,
+            sim_empty,
+            antenna_vols,
+            config,
+            decay_tol=DFT_DECAY_TOL,
+            max_run_time=DFT_MAX_RUN_TIME,
         )
-        
-        # # =====================================================
-        # print_task(4, "Postprocesing - raw animations for X.")
-        # animate_raw_fields(config=config, mode="BOTH", component="X")
-        # # =====================================================
-        # print_task(4, "Postprocesing - raw animations for Y.")
-        # animate_raw_fields(config=config, mode="BOTH", component="Y")
-        # # =====================================================
-        # print_task(4, "Postprocesing - raw animations for Z.")
-        # animate_raw_fields(config=config, mode="BOTH", component="Z")
-        # # =====================================================      
-        
-        # roi_w = gap
-        # roi_h = 10
 
-        # # Postprocessing - gap zoom
-        # draw_params = {
-        #         "XY": {"x_zoom": 0.4,
-        #             "y_zoom": 0.4,
-        #             "roi": {
-        #                     "center": (0, 0),
-        #                     "width": roi_w,
-        #                     "height": roi_h,
-        #                 },
-        #         },
-        #         "XZ": {"x_zoom": 0.5,
-        #             "y_zoom": 0.9,
-        #             "roi": {
-        #                     "center": (0, -1e3*TiBetween.thickness/2.0),
-        #                     "width": roi_w,
-        #                     "height": (AuTop.thickness + TiBetween.thickness) * 1e3,
-        #                 },
-        #         },
-        #         "YZ": {"x_zoom": 0.5,
-        #             "y_zoom": 0.9,
-        #             "roi": {
-        #                     "center": (0, -1e3*TiBetween.thickness/2.0),
-        #                     "width": roi_h,
-        #                     "height": (AuTop.thickness + TiBetween.thickness) * 1e3,
-        #                 },
-        #         },
-        # }
+        if mp.am_master() and max_enh:
+            summary_path = os.path.join("results", "DFT_enhancement_summary.txt")
+            write_header = not os.path.exists(summary_path)
+            with open(summary_path, "a") as f:
+                if write_header:
+                    f.write("SIM_NAME\tWavelength[nm]\t" + "\t".join(max_enh.keys()) + "\n")
+                f.write(SIM_NAME + f"\t{p['Wavelength']:.2f}\t"
+                        + "\t".join(f"{v:.3f}" for v in max_enh.values()) + "\n")
 
-        # print_task(5, "Postprocesing - animations and plots.")
-
-        # animate_enhancement_fields(config=config, volumes=antenna_vols, draw_params=draw_params, animate=False)
-        
-        # =====================================================
-        plot_signal_amplitude_vs_time_from_h5(
-            "xyplanar-empty_ex.h5",
-            load_h5data_path=config.path_to_save,
-            xzeros=0,
-            time_step=config.sim_time_step,
-            save_name=f"source_prof_empty"
-        )
-        plot_signal_amplitude_vs_time_from_h5(
-            "xyplanar_ex.h5",
-            load_h5data_path=config.path_to_save,
-            xzeros=0,
-            time_step=config.sim_time_step,
-            save_name=f"source_prof_antenna"
-        )
+        # NOTE: time-domain h5 dumps are no longer produced, so the
+        # source-profile plots below would fail - disabled
+        # plot_signal_amplitude_vs_time_from_h5(
+        #     "xyplanar-empty_ex.h5",
+        #     load_h5data_path=config.path_to_save,
+        #     xzeros=0,
+        #     time_step=config.sim_time_step,
+        #     save_name=f"source_prof_empty"
+        # )
+        # plot_signal_amplitude_vs_time_from_h5(
+        #     "xyplanar_ex.h5",
+        #     load_h5data_path=config.path_to_save,
+        #     xzeros=0,
+        #     time_step=config.sim_time_step,
+        #     save_name=f"source_prof_antenna"
+        # )
 
         sim.reset_meep()
         sim_empty.reset_meep()
 
         del sim
         del sim_empty
-    
+
         import gc
         gc.collect()
-        
+
         if mp.am_master():
             print("Pamięć zresetowana. Przechodzę do kolejnej anteny.")
-        
+
     return 0
 
 def bowtie_calculate_resonant_peaks():
@@ -465,9 +497,11 @@ def bowtie_calculate_resonant_peaks():
     center_wavelength_nm = (1.0 / fcen) * xm  # około 7338.7 nm
     nfreq = 200
 
-    config.resolution = 350                   
+    config.resolution = 350
     config.lambda0 = center_wavelength_nm / xm
-    config.frequency_width = df * config.lambda0
+    # fwidth in Meep frequency units, slightly wider than the scanned band;
+    # the spectral envelope cancels in the ant/empty DFT ratio anyway
+    config.frequency_width = 1.5 * df
 
     sweeps = [
         # {"name": "BowTie_L300", "gap": 30, "L": 300, "W": 300},
@@ -490,7 +524,7 @@ def bowtie_calculate_resonant_peaks():
         
     if mp.am_master():
         with open(results_filename, "w") as f:
-            f.write("Geometria\tGap[nm]\tL[nm]\tW[nm]\tResonant_Wavelength[nm]\tMax_FEF\n")
+            f.write("Geometria\tGap[nm]\tL[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
 
     freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
 
@@ -504,8 +538,10 @@ def bowtie_calculate_resonant_peaks():
         Th_Au = 30 / xm
         Th_Ti = 5 / xm
         Th_Sub = 100 / xm
-        L_Sub = (p["gap"] + 2 * p["L_bar"] + p["L_tip"] + 400)/xm
-        W_Sub = (p["W"] + 400)/xm
+        # BUGFIX: previously referenced p["L_bar"] etc. (leftover from the
+        # hybridbar loop variable); bowtie total length = 2*L + gap
+        L_Sub = (params["gap"] + 2 * params["L"] + 400)/xm
+        W_Sub = (params["W"] + 400)/xm
         radius = 5 / xm
 
         AuTop = BowTie(gap=gap, length=L_tri, width=width, thickness=Th_Au, radius=radius, material=Au, z_offset=0.0)
@@ -550,82 +586,89 @@ def bowtie_calculate_resonant_peaks():
         config.src_size = [L_Sub, W_Sub, 0.0]
         config.src_center = [0.0, 0.0, config.cell_size[2]/2.0 - 1.15*config.pml]
 
-        try:
-            from mpi4py import MPI
-            comm = MPI.COMM_WORLD
-        except ImportError:
-            comm = None
+        comm, MPI = _get_mpi_comm()
 
-        dft_size = mp.Vector3(gap, 10/xm, 10/xm) 
+        # full gap box (touches the metal tips at x = +-gap/2)
+        dft_size = mp.Vector3(gap, 10/xm, 10/xm)
+        # inner box: exclude ~2 pixels next to each metal tip, where the
+        # discretized corner fields are singular and do not converge
+        inner_gap = max(gap - 4.0/config.resolution, 0.4*gap)
+        dft_size_inner = mp.Vector3(inner_gap, 10/xm, 10/xm)
 
         sim_empty = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=[], sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
 
         dft_empty = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
-        
-        sim_empty.run(until=15000 / xm)
-        
-        empty_data = []
-        for i in range(nfreq):
-            arr = sim_empty.get_dft_array(dft_empty, mp.Ex, i)
-            val = np.max(np.abs(arr)) if (arr is not None and arr.size > 0) else 0.0
-            
-            if comm is not None:
-                val = comm.allreduce(val, op=MPI.MAX)
-            empty_data.append(val)
-        empty_data = np.array(empty_data)
-        
+        dft_empty_in = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
+        dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+
+        # run until the DFT fields converge (pulse + ring-down), instead of
+        # a fixed time shorter than the source itself
+        sim_empty.run(until_after_sources=mp.stop_when_dft_decayed(
+            tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
+        if mp.am_master():
+            print(f"EMPTY run finished at t = {sim_empty.meep_time():.1f}")
+
+        empty_max, empty_mean, empty_center = _dft_gap_spectra(
+            sim_empty, dft_empty, dft_empty_in, dft_empty_c, nfreq, comm, MPI)
+
         sim_empty.reset_meep()
 
         sim = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=geometry, sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
-        
+
         dft_ant = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
-        
-        sim.run(until=15000 / xm)
-        
-        ant_data = []
-        for i in range(nfreq):
-            arr = sim.get_dft_array(dft_ant, mp.Ex, i)
-            val = np.max(np.abs(arr)) if (arr is not None and arr.size > 0) else 0.0
-            
-            if comm is not None:
-                val = comm.allreduce(val, op=MPI.MAX)
-            ant_data.append(val)
-        ant_data = np.array(ant_data)
-        
+        dft_ant_in = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
+        dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+
+        sim.run(until_after_sources=mp.stop_when_dft_decayed(
+            tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
+        if mp.am_master():
+            print(f"ANTENNA run finished at t = {sim.meep_time():.1f}")
+
+        ant_max, ant_mean, ant_center = _dft_gap_spectra(
+            sim, dft_ant, dft_ant_in, dft_ant_c, nfreq, comm, MPI)
+
         sim.reset_meep()
 
         if mp.am_master():
-            fef_spectrum = np.abs(ant_data)**2 / (np.abs(empty_data)**2 + 1e-16)
-            best_idx = np.argmax(fef_spectrum)
-            best_freq = freqs[best_idx]
-            max_fef = fef_spectrum[best_idx]
-            best_wavelength_nm = (1.0 / best_freq) * xm
-            print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm (Max FEF = {max_fef:.2f})")
+            eps = 1e-16
+            fef_max = ant_max**2 / (empty_max**2 + eps)          # hottest pixel (grid-singular)
+            fef_mean = ant_mean / (empty_mean + eps)             # gap-averaged intensity
+            fef_center = ant_center**2 / (empty_center**2 + eps) # gap centre point
 
-            # --- NOWY KOD: RYSOWANIE WYKRESU WIDMA ---
+            # peak selected from the gap-averaged spectrum (robust w.r.t.
+            # staircase singularities at metal corners)
+            best_idx = np.argmax(fef_mean)
+            best_freq = freqs[best_idx]
+            best_wavelength_nm = (1.0 / best_freq) * xm
+            print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
+                  f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
+                  f"FEF_center = {fef_center[best_idx]:.2f}, "
+                  f"FEF_max_px = {fef_max[best_idx]:.2f})")
+
             import matplotlib.pyplot as plt
-            
-            # Przeliczamy całą oś częstotliwości (wszystkie 200 punktów) na nanometry
+
             wavelengths_nm = (1.0 / freqs) * xm
-            
+
             plt.figure(figsize=(8, 5))
-            plt.plot(wavelengths_nm, fef_spectrum, '-', color='darkred', linewidth=2, label='FEF Spectrum')
-            plt.plot(best_wavelength_nm, max_fef, 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
-            
+            plt.semilogy(wavelengths_nm, fef_mean, '-', color='darkred', linewidth=2, label='FEF mean (gap)')
+            plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre')
+            plt.semilogy(wavelengths_nm, fef_max, '--', color='gray', linewidth=1.5, label='FEF max pixel')
+            plt.plot(best_wavelength_nm, fef_mean[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
+
             plt.xlabel('Wavelength [nm]', fontsize=14)
             plt.ylabel('Field Enhancement Factor (FEF)', fontsize=14)
             plt.title(f'Resonance Spectrum: length {params["L"]} nm, width {params["W"]} nm', fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.7)
             plt.legend(fontsize=12)
             plt.tight_layout()
-            
+
             plot_filename = os.path.join("results", f"spectrum_gap_{params['gap']}nm_L_{params['L']}nm_W_{params['W']}nm.png")
             plt.savefig(plot_filename, dpi=300)
             plt.close()
             print(f"Zapisano wykres widma: {plot_filename}")
 
             with open(results_filename, "a") as f:
-                f.write(f"{params['name']}\t{params['gap']}\t{params['L']}\t{params['W']}\t{best_wavelength_nm:.2f}\t{max_fef:.2f}\n")
+                f.write(f"{params['name']}\t{params['gap']}\t{params['L']}\t{params['W']}\t{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}\n")
 
     if mp.am_master():
         print_task(5, f" Wyniki zapisano w {results_filename}")
@@ -649,17 +692,22 @@ def bowtie_AuTiSiO2_opt():
         plt.close('all')
 
         config.resolution = 350
-        config.sim_time = 12000 / xm
+        config.sim_time = 12000 / xm      # unused by DFT maps (kept for other utils)
         config.sim_time_step = 50 / xm
         config.lambda0 = p["Wavelength"] / xm
-        config.frequency_width = 1.0
+        # moderate-bandwidth Gaussian pulse centred at the resonance; the
+        # spectral envelope cancels in the DFT ant/empty ratio, so this only
+        # sets the pulse duration (~10/fwidth), not the physics
+        config.frequency_width = config.frequency
         gap = p["gap"]
         L_tri = p["L"]/xm
         width = p["W"]/xm
         Th_Au = 30/xm
         Th_Ti = 5/xm
         Th_Sub = 100/xm
-        L_Sub = (p["gap"] + 2 * p["L_bar"] + p["L_tip"] + 400)/xm
+        # BUGFIX: previously referenced p["L_bar"]/p["L_tip"] (hybridbar
+        # keys); bowtie total length = 2*L + gap
+        L_Sub = (p["gap"] + 2 * p["L"] + 400)/xm
         W_Sub = (p["W"] + 400)/xm
         radius = 5 /xm
 
@@ -791,80 +839,26 @@ def bowtie_AuTiSiO2_opt():
                 IMG_CLOSE=config.IMG_CLOSE
             )
         # =====================================================
-        print_task(3, "3D calculations.")
-        compute_fields(
-            sim, 
-            sim_empty, 
-            antenna_vols, 
-            config, 
-            fluxes = False,
-            scattering = False,
-            dft_gap_spectrum = False,
-            harminv = False,
-            scattering_antenna=AuTop
+        print_task(3, "3D calculations - DFT enhancement maps at resonance.")
+        # steady-state |E|^2 enhancement maps at lambda0, directly comparable
+        # with the FEF values from bowtie_calculate_resonant_peaks()
+        max_enh = compute_dft_enhancement_maps(
+            sim,
+            sim_empty,
+            antenna_vols,
+            config,
+            decay_tol=DFT_DECAY_TOL,
+            max_run_time=DFT_MAX_RUN_TIME,
         )
-        
-        # # =====================================================
-        # print_task(4, "Postprocesing - raw animations for X.")
-        # animate_raw_fields(config=config, mode="BOTH", component="X")
-        # # =====================================================
-        # print_task(4, "Postprocesing - raw animations for Y.")
-        # animate_raw_fields(config=config, mode="BOTH", component="Y")
-        # # =====================================================
-        # print_task(4, "Postprocesing - raw animations for Z.")
-        # animate_raw_fields(config=config, mode="BOTH", component="Z")
-        # # =====================================================      
-        
-        # roi_w = gap
-        # roi_h = 10
 
-        # # Postprocessing - gap zoom
-        # draw_params = {
-        #         "XY": {"x_zoom": 0.4,
-        #             "y_zoom": 0.4,
-        #             "roi": {
-        #                     "center": (0, 0),
-        #                     "width": roi_w,
-        #                     "height": roi_h,
-        #                 },
-        #         },
-        #         "XZ": {"x_zoom": 0.5,
-        #             "y_zoom": 0.9,
-        #             "roi": {
-        #                     "center": (0, -1e3*TiBetween.thickness/2.0),
-        #                     "width": roi_w,
-        #                     "height": (AuTop.thickness + TiBetween.thickness) * 1e3,
-        #                 },
-        #         },
-        #         "YZ": {"x_zoom": 0.5,
-        #             "y_zoom": 0.9,
-        #             "roi": {
-        #                     "center": (0, -1e3*TiBetween.thickness/2.0),
-        #                     "width": roi_h,
-        #                     "height": (AuTop.thickness + TiBetween.thickness) * 1e3,
-        #                 },
-        #         },
-        # }
-
-        # print_task(5, "Postprocesing - animations and plots.")
-
-        # animate_enhancement_fields(config=config, volumes=antenna_vols, draw_params=draw_params, animate=False)
-        
-        # =====================================================
-        plot_signal_amplitude_vs_time_from_h5(
-            "xyplanar-empty_ex.h5",
-            load_h5data_path=config.path_to_save,
-            xzeros=0,
-            time_step=config.sim_time_step,
-            save_name=f"source_prof_empty"
-        )
-        plot_signal_amplitude_vs_time_from_h5(
-            "xyplanar_ex.h5",
-            load_h5data_path=config.path_to_save,
-            xzeros=0,
-            time_step=config.sim_time_step,
-            save_name=f"source_prof_antenna"
-        )
+        if mp.am_master() and max_enh:
+            summary_path = os.path.join("results", "DFT_enhancement_summary.txt")
+            write_header = not os.path.exists(summary_path)
+            with open(summary_path, "a") as f:
+                if write_header:
+                    f.write("SIM_NAME\tWavelength[nm]\t" + "\t".join(max_enh.keys()) + "\n")
+                f.write(SIM_NAME + f"\t{p['Wavelength']:.2f}\t"
+                        + "\t".join(f"{v:.3f}" for v in max_enh.values()) + "\n")
 
         sim.reset_meep()
         sim_empty.reset_meep()
@@ -880,24 +874,86 @@ def bowtie_AuTiSiO2_opt():
         
     return 0
 
+def postprocess_dft_efe():
+    """
+    LOKALNY postprocessing wynikow z compute_dft_enhancement_maps (na Aresie
+    zapisywane sa tylko male pliki dft_enhancement_*.h5 + field_vs_time_gap.dat,
+    bez PNG). Ta funkcja renderuje mapy PNG i zapisuje srednie/maksymalne
+    wzmocnienie w przerwie do pliku txt.
+    """
+    simulations = [
+        # {"folder": "HybridBar_gap_30nm_Lbar_1600nm_Ltip_150_W_240nm_AuTiSiO2_res350_lambda_9.57313", "gap": 30},
+    ]
+
+    Th_Au = 30.0  # nm
+    Th_Ti = 5.0   # nm
+
+    results_filename = "results/DFT_EFE_summary.txt"
+
+    if mp.am_master():
+        with open(results_filename, "w") as f:
+            f.write("Folder\tGap[nm]\t"
+                    "meanROI_XY\tmaxROI_XY\tmax_XY\t"
+                    "meanROI_XYTOP\tmaxROI_XYTOP\tmax_XYTOP\t"
+                    "meanROI_XZ\tmaxROI_XZ\tmax_XZ\t"
+                    "meanROI_YZ\tmaxROI_YZ\tmax_YZ\n")
+
+    for sim in simulations:
+        folder = sim["folder"]
+        gap_nm = sim["gap"]
+
+        load_path = os.path.join("results", folder)
+        if not os.path.exists(load_path):
+            print(f"Brak folderu {folder}, pomijam...")
+            continue
+
+        print_task(1, f"Postprocessing map DFT dla: {folder}")
+
+        # ROI w nm: przerwa miedzy ramionami (XY) oraz przekroje przez
+        # warstwy Au+Ti (XZ, YZ); z=0 to srodek warstwy Au
+        roi_nm = {
+            "XY": {"center": (0.0, 0.0), "width": gap_nm, "height": 10.0},
+            "XZ": {"center": (0.0, -Th_Ti/2.0), "width": gap_nm, "height": Th_Au + Th_Ti},
+            "YZ": {"center": (0.0, -Th_Ti/2.0), "width": 10.0, "height": Th_Au + Th_Ti},
+        }
+
+        stats = postprocess_dft_enhancement_maps(load_path, roi_nm=roi_nm)
+
+        if mp.am_master() and stats:
+            row = [folder, str(gap_nm)]
+            for plane in ["xyplanar", "xyplanarTOP", "xzplanar", "yzplanar"]:
+                s = stats.get(plane, {})
+                row.append(f"{s.get('mean_roi', 0.0):.3f}")
+                row.append(f"{s.get('max_roi', 0.0):.3f}")
+                row.append(f"{s.get('max', 0.0):.3f}")
+            with open(results_filename, "a") as f:
+                f.write("\t".join(row) + "\n")
+
+    if mp.am_master():
+        print_task(5, f"Wyniki zapisano w {results_filename}")
+    return 0
+
 def postprocess_hybrid_efe():
     config = SimulationConfig()
     
+    # Zmieniłem klucze w słowniku z "L" i "T" na "L_bar" i "L_tip" dla spójności
     simulations = [
-        {"folder": "HybridBar_gap_10nm_AuTiSiO2_res_500",        "gap": 10, "L": 1600, "T": 150, "W": 240},
+        {"folder": "HybridBar_gap_30nm_Lbar_1600nm_Ltip_150_W_240nm_AuTiSiO2_res350_lambda_9.57313", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 240},
+        {"folder": "HybridBar_gap_30nm_Lbar_1400nm_Ltip_150_W_240nm_AuTiSiO2_res350_lambda_6.90951", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 240},
+        {"folder": "HybridBar_gap_30nm_Lbar_1200nm_Ltip_150_W_240nm_AuTiSiO2_res350_lambda_6.34031", "gap": 30, "L_bar": 1200, "L_tip": 150, "W": 240},
     ]
 
     results_filename = "results/EFE_summary_hybrid.txt"
     
     if mp.am_master():
         with open(results_filename, "w") as f:
-            f.write("Folder\tGap[nm]\tL_bar[nm]\tT_tip[nm]\tW[nm]\tEFE_XY\tEFE_XZ\tEFE_YZ\n")
+            f.write("Folder\tGap[nm]\tL_bar[nm]\tL_tip[nm]\tW[nm]\tEFE_XY\tEFE_XZ\tEFE_YZ\n")
 
     for sim in simulations:
         folder = sim["folder"]
         gap_nm = sim["gap"]
-        L_bar_nm = sim["L"]
-        L_tip_nm = sim["T"]
+        L_bar_nm = sim["L_bar"]
+        L_tip_nm = sim["L_tip"]
         width_nm = sim["W"]
         
         print_task(1, f"Przetwarzanie post-processing dla: {folder}")
@@ -916,7 +972,12 @@ def postprocess_hybrid_efe():
         width = width_nm / xm
         Th_Au = 30 / xm
         Th_Ti = 5 / xm
-        Th_Sub = 70 / xm
+        Th_Sub = 100 / xm
+        
+        # WZÓR MUSI BYĆ IDENTYCZNY JAK W SYMULACJI GŁÓWNEJ
+        L_Sub = (gap_nm + 2 * L_bar_nm + L_tip_nm + 400) / xm
+        W_Sub = (width_nm + 400) / xm
+        radius = 5 / xm
 
         AuTop = HybridBar(
             gap=gap_nm/xm, 
@@ -925,7 +986,8 @@ def postprocess_hybrid_efe():
             width=width, 
             thickness=Th_Au, 
             material=Au, 
-            z_offset=0.0
+            z_offset=0.0,
+            radius=radius
         )
 
         TiBetween = HybridBar(
@@ -935,32 +997,34 @@ def postprocess_hybrid_efe():
             width=width, 
             thickness=Th_Ti, 
             material=Ti, 
-            z_offset=-(Th_Au + Th_Ti)/2.0
+            z_offset=-(Th_Au + Th_Ti)/2.0,
+            radius=radius
         )
         
-        config.pad = 100 / xm
-        config.pml = 100 / xm
-        total_len = (L_bar + L_tip) * 2 + (gap_nm/xm)
+        # PARAMETRY SIATKI MUSZĄ BYĆ IDENTYCZNE (było 100, zmienione na poprawne z aresa)
+        config.pad = 200 / xm
+        config.pml = 500 / xm
         
         config.cell_size = [
-            total_len + 2*config.pad + 2*config.pml,
-            width + 2*config.pad + 2*config.pml,
-            (Th_Au + Th_Ti + Th_Sub) + 2*config.pad + 2*config.pml
+            L_Sub + 2*config.pad + 2*config.pml,
+            W_Sub + 2*config.pad + 2*config.pml,
+            Th_Sub + AuTop.thickness + TiBetween.thickness + 2*config.pad + 2*config.pml
         ]
         
         cell = make_cell(config=config)
         
-        antenna_vols = VolumeSet(cell, antenna=AuTop, top_z=AuTop.thickness)
+        # Zmieniono VolumeSet na VolumeSetROI, by pasowało do klasy
+        antenna_vols = VolumeSetROI(cell, antenna=AuTop)
         
         roi_w = gap_nm
         roi_h = 5
         
         draw_params = {
-            "XY": {"x_zoom": 0.05, "y_zoom": 0.1, 
-                   "roi": {"center": (-1, 0), "width": roi_w, "height": roi_h}},
-            "XZ": {"x_zoom": 0.05, "y_zoom": 0.2, 
-                   "roi": {"center": (-1, -1e3*TiBetween.thickness/2.0), "width": roi_w, "height": (AuTop.thickness + TiBetween.thickness) * 1e3}},
-            "YZ": {"x_zoom": 0.2, "y_zoom": 0.2, 
+            "XY": {"x_zoom": 0.05, "y_zoom": 0.2, 
+                   "roi": {"center": (0, 0), "width": roi_w, "height": roi_h}}, # Poprawiono środek z (-1, 0) na (0, 0) - centrum szczeliny
+            "XZ": {"x_zoom": 0.05, "y_zoom": 0.8, 
+                   "roi": {"center": (0, -1e3*TiBetween.thickness/2.0), "width": roi_w, "height": (AuTop.thickness + TiBetween.thickness) * 1e3}},
+            "YZ": {"x_zoom": 0.25, "y_zoom": 0.8, 
                    "roi": {"center": (0, -1e3*TiBetween.thickness/2.0), "width": roi_h, "height": (AuTop.thickness + TiBetween.thickness) * 1e3}},
         }
 
@@ -980,15 +1044,15 @@ def postprocess_bowties_efe():
     config = SimulationConfig()
     
     simulations = [
-        {"folder": "BowTie_gap_10nm_gap_10nm_AuTiSiO2_res300",     "gap": 10, "L": 500, "W": 300},
-        {"folder": "BowTie_gap_30nm_lenghts_300nm_AuTiSiO2_res300", "gap": 30, "L": 300, "W": 300},
-        {"folder": "BowTie_gap_30nm_lenghts_400nm_AuTiSiO2_res300", "gap": 30, "L": 400, "W": 300},
-        {"folder": "BowTie_gap_30nm_widths_300nm_AuTiSiO2_res300",  "gap": 30, "L": 500, "W": 300},
-        {"folder": "BowTie_gap_30nm_widths_400nm_AuTiSiO2_res300",  "gap": 30, "L": 500, "W": 400},
-        {"folder": "BowTie_gap_30nm_widths_500nm_AuTiSiO2_res300",  "gap": 30, "L": 500, "W": 500},
-        {"folder": "BowTie_gap_50nm_gaps_50nm_AuTiSiO2_res300",     "gap": 50, "L": 500, "W": 300},
-        {"folder": "BowTie_gap_70nm_gaps_70nm_AuTiSiO2_res300",     "gap": 70, "L": 500, "W": 300},
-        {"folder": "BowTie_gap_30nm_lenghts_150nm_AuTiSiO2_res300", "gap": 30, "L": 150, "W": 300},
+        # {"folder": "BowTie_gap_10nm_gap_10nm_AuTiSiO2_res300",     "gap": 10, "L": 500, "W": 300},
+        # {"folder": "BowTie_gap_30nm_lenghts_300nm_AuTiSiO2_res300", "gap": 30, "L": 300, "W": 300},
+        # {"folder": "BowTie_gap_30nm_lenghts_400nm_AuTiSiO2_res300", "gap": 30, "L": 400, "W": 300},
+        # {"folder": "BowTie_gap_30nm_widths_300nm_AuTiSiO2_res300",  "gap": 30, "L": 500, "W": 300},
+        # {"folder": "BowTie_gap_30nm_widths_400nm_AuTiSiO2_res300",  "gap": 30, "L": 500, "W": 400},
+        # {"folder": "BowTie_gap_30nm_widths_500nm_AuTiSiO2_res300",  "gap": 30, "L": 500, "W": 500},
+        # {"folder": "BowTie_gap_50nm_gaps_50nm_AuTiSiO2_res300",     "gap": 50, "L": 500, "W": 300},
+        # {"folder": "BowTie_gap_70nm_gaps_70nm_AuTiSiO2_res300",     "gap": 70, "L": 500, "W": 300},
+        {"folder": "BowTie_gap_30nm_L_1000nm_W_800nm_AuTiSiO2_res400_lambda_4.849", "gap": 30, "L": 1000, "W": 800},
     ]
 
     results_filename = "results/EFE_summary.txt"
