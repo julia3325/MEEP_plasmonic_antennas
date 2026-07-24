@@ -26,22 +26,27 @@ def _get_mpi_comm():
     except ImportError:
         return None, None
 
-def _pick_resonance_idx(spectrum, edge_guard=2):
+def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1):
     """
     Pick the wavelength of MAXIMUM in-band enhancement.
 
     The scan window (5700-10300 nm) is the tuning range of the laser used
     in the lab, so the quantity of interest is the best enhancement
     ACHIEVABLE within that band - not the vacuum resonance position. Hence
-    a plain argmax over the window: if the spectrum peaks inside, that is
-    the resonance; if it rises monotonically to an edge, the edge value is
-    the best the laser can reach and is a valid (if sub-optimal) result.
+    argmax over the window: if the spectrum peaks inside, that is the
+    resonance; if it rises to an edge, the edge value is the best the laser
+    can reach and is a valid (if sub-optimal) result.
 
-    `edge_guard` only trims a couple of outermost points to reject pure DFT
-    edge spikes (very low source SNR at the extreme frequencies). The
-    returned `at_boundary` flag marks geometries whose true resonance lies
-    outside the band (best point sits at the window edge) - useful because
-    those geometries are not ideally matched to the laser.
+    SNR mask (`ref`): the ant/empty ratio is meaningless where the empty
+    reference field is near zero (division by noise). Passing the empty
+    spectrum restricts the search to frequencies where the reference is at
+    least `snr_frac` of its own maximum, killing the spurious band-edge
+    spike that otherwise pins every geometry to the same bluest point. With
+    a properly broad source this mask excludes nothing legitimate.
+
+    `edge_guard` additionally trims a couple of outermost points. The
+    returned `at_boundary` flag marks geometries whose best point sits at
+    the window edge (true resonance likely outside the laser band).
 
     Returns
     -------
@@ -51,7 +56,18 @@ def _pick_resonance_idx(spectrum, edge_guard=2):
     g = min(edge_guard, n // 2)
     lo, hi = g, n - g  # search range [lo, hi)
 
-    idx = int(np.argmax(spectrum[lo:hi]) + lo)
+    search = np.full(n, -np.inf)
+    search[lo:hi] = np.asarray(spectrum[lo:hi], dtype=float)
+
+    if ref is not None:
+        ref = np.asarray(ref, dtype=float)
+        thr = snr_frac * np.max(ref[lo:hi])
+        low_snr = ref < thr
+        # only apply the mask if it leaves something to choose from
+        if np.any(np.isfinite(search) & ~low_snr):
+            search[low_snr] = -np.inf
+
+    idx = int(np.argmax(search))
     # flag if the chosen point is at (or right next to) either window edge
     at_boundary = (idx <= lo + 1) or (idx >= hi - 2)
     return idx, at_boundary
@@ -117,9 +133,12 @@ def hybridbar_calculate_resonant_peaks():
 
     config.resolution = 350
     config.lambda0 = center_wavelength_nm / xm
-    # fwidth in Meep frequency units, slightly wider than the scanned band;
-    # the spectral envelope cancels in the ant/empty DFT ratio anyway
-    config.frequency_width = 1.5 * df
+    # fwidth MUST be broad enough that the empty (reference) field has good
+    # SNR across the WHOLE scanned band, otherwise ant/empty blows up at the
+    # band edges (division by a near-zero reference) and the peak pins to the
+    # bluest point for every geometry. 6*df reproduces the old working source
+    # (old code used df*lambda0 ~ 7*df). The envelope cancels in the ratio.
+    config.frequency_width = 6.0 * df
 
     sweeps = [
         # {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 240},
@@ -256,7 +275,7 @@ def hybridbar_calculate_resonant_peaks():
             # dipolar gap resonance cleanly, unlike the gap-averaged one
             # whose rising short-wavelength background pushes argmax to the
             # window edge. Interior local-max search avoids boundary pinning.
-            best_idx, at_boundary = _pick_resonance_idx(fef_center)
+            best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=empty_center)
             best_freq = freqs[best_idx]
             best_wavelength_nm = (1.0 / best_freq) * xm
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
@@ -532,9 +551,12 @@ def bowtie_calculate_resonant_peaks():
 
     config.resolution = 350
     config.lambda0 = center_wavelength_nm / xm
-    # fwidth in Meep frequency units, slightly wider than the scanned band;
-    # the spectral envelope cancels in the ant/empty DFT ratio anyway
-    config.frequency_width = 1.5 * df
+    # fwidth MUST be broad enough that the empty (reference) field has good
+    # SNR across the WHOLE scanned band, otherwise ant/empty blows up at the
+    # band edges (division by a near-zero reference) and the peak pins to the
+    # bluest point for every geometry. 6*df reproduces the old working source
+    # (old code used df*lambda0 ~ 7*df). The envelope cancels in the ratio.
+    config.frequency_width = 6.0 * df
 
     sweeps = [
         # {"name": "BowTie_L300", "gap": 30, "L": 300, "W": 300},
@@ -672,7 +694,7 @@ def bowtie_calculate_resonant_peaks():
             # dipolar gap resonance cleanly, unlike the gap-averaged one
             # whose rising short-wavelength background pushes argmax to the
             # window edge. Interior local-max search avoids boundary pinning.
-            best_idx, at_boundary = _pick_resonance_idx(fef_center)
+            best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=empty_center)
             best_freq = freqs[best_idx]
             best_wavelength_nm = (1.0 / best_freq) * xm
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
