@@ -313,6 +313,183 @@ def hybridbar_calculate_resonant_peaks():
         print_task(5, f" Wyniki zapisano w {results_filename}")
     return 0
 
+def splitbar_calculate_resonant_peaks():
+    """
+    Resonant-wavelength scan for the SPLIT-BAR antenna (two plain rectangular
+    bars, NO triangular tips), repeated for TWO substrates: SiO2 and Si.
+
+    Same method as hybridbar_calculate_resonant_peaks: one broadband pulse +
+    converged DFT (stop_when_dft_decayed), FEF = |E_ant|^2/|E_empty|^2 in the
+    gap, peak position taken from the gap-centre spectrum. For every geometry
+    the scan runs once per substrate, so you can read off the substrate shift
+    directly (Si has a much higher index than SiO2 -> strong RED-shift).
+
+    sweeps dict keys: name, gap, L, W
+        L = length of ONE bar arm; the full dipole span is 2*L + gap.
+        (No L_tip - a split bar has no tips.)
+    """
+    config = SimulationConfig()
+
+    lambda_min_nm = 5700.0
+    lambda_max_nm = 10300.0
+
+    fmin = 1.0 / (lambda_max_nm / xm)
+    fmax = 1.0 / (lambda_min_nm / xm)
+
+    fcen = 0.5 * (fmin + fmax)
+    df = fmax - fmin
+
+    center_wavelength_nm = (1.0 / fcen) * xm
+    nfreq = 200
+
+    config.resolution = 350   # lower to ~200-250 for screening
+    config.lambda0 = center_wavelength_nm / xm
+    config.frequency_width = 6.0 * df   # broad source; cancels in the ratio
+
+    # Substrates to scan: (label, meep material). Si = crystalline silicon
+    # (cSi). NOTE: the paper's p++ Si is doped (extra free-carrier loss) and
+    # sits under a 300 nm SiO2 spacer - to reproduce it exactly, stack Si with
+    # a thin SiO2 layer here. Also, the antenna near-field penetrates deeper
+    # than the 100 nm Th_Sub below; for a full high-index-substrate effect
+    # increase Th_Sub (a thin Si layer underestimates the red-shift).
+    substrates = [
+        ("SiO2", SiO2),
+        ("Si",   cSi),
+    ]
+
+    sweeps = [
+        {"name": "SplitBar", "gap": 20, "L": 1800, "W": 240},
+        # {"name": "SplitBar", "gap": 20, "L": 890,  "W": 240},  # ~1.8 um TOTAL dipole (paper L1)
+    ]
+
+    results_filename = "results/resonant_peaks_splitbar_summary.txt"
+    if not os.path.exists("results") and mp.am_master():
+        os.makedirs("results")
+
+    if mp.am_master():
+        with open(results_filename, "w") as f:
+            f.write("Geometria\tSubstrate\tGap[nm]\tL[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
+
+    freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
+
+    for sub_name, sub_material in substrates:
+        for p in sweeps:
+            mp.print_messages = False
+            print_task(1, f"Szukanie rezonansu (split-bar, podloze {sub_name}): {p['name']} L={p['L']} W={p['W']}")
+
+            L_arm = p["L"] / xm
+            width = p["W"] / xm
+            gap = p["gap"] / xm
+
+            Th_Au = 30 / xm
+            Th_Ti = 5 / xm
+            Th_Sub = 100 / xm
+            L_Sub = (p["gap"] + 2 * p["L"] + 400) / xm   # 2*L + gap + margin
+            W_Sub = (p["W"] + 400) / xm
+            radius = 5 / xm
+
+            AuTop = SplitBar(gap=gap, length=L_arm, width=width, thickness=Th_Au, radius=radius, material=Au, z_offset=0.0)
+            TiBetween = SplitBar(gap=gap, length=L_arm, width=width, thickness=Th_Ti, radius=radius, material=Ti, z_offset=-(Th_Au + Th_Ti)/2.0)
+
+            substrate = mp.Block(size=mp.Vector3(L_Sub, W_Sub, Th_Sub), center=mp.Vector3(0, 0, -(Th_Au/2.0 + Th_Ti + Th_Sub/2.0)), material=sub_material)
+
+            geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate]
+
+            config.pad = 200 / xm
+            config.pml = 350 / xm
+            config.cell_size = [
+                L_Sub + 2*config.pad + 2*config.pml,
+                W_Sub + 2*config.pad + 2*config.pml,
+                Th_Sub + AuTop.thickness + TiBetween.thickness + 2*config.pad + 2*config.pml
+            ]
+
+            cell = make_cell(config=config)
+
+            config.src_size = [L_Sub, W_Sub, 0.0]
+            config.src_center = [0.0, 0.0, config.cell_size[2]/2.0 - 1.15*config.pml]
+
+            comm, MPI = _get_mpi_comm()
+
+            dft_size = mp.Vector3(gap, 10/xm, 10/xm)
+            inner_gap = max(gap - 4.0/config.resolution, 0.4*gap)
+            dft_size_inner = mp.Vector3(inner_gap, 10/xm, 10/xm)
+
+            sim_empty = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=[], sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
+
+            dft_empty = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
+            dft_empty_in = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
+            dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+
+            sim_empty.run(until_after_sources=mp.stop_when_dft_decayed(
+                tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
+            if mp.am_master():
+                print(f"[{sub_name}] EMPTY run finished at t = {sim_empty.meep_time():.1f}")
+
+            empty_max, empty_mean, empty_center = _dft_gap_spectra(
+                sim_empty, dft_empty, dft_empty_in, dft_empty_c, nfreq, comm, MPI)
+
+            sim_empty.reset_meep()
+
+            sim = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=geometry, sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
+
+            dft_ant = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
+            dft_ant_in = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
+            dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+
+            sim.run(until_after_sources=mp.stop_when_dft_decayed(
+                tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
+            if mp.am_master():
+                print(f"[{sub_name}] ANTENNA run finished at t = {sim.meep_time():.1f}")
+
+            ant_max, ant_mean, ant_center = _dft_gap_spectra(
+                sim, dft_ant, dft_ant_in, dft_ant_c, nfreq, comm, MPI)
+
+            sim.reset_meep()
+
+            if mp.am_master():
+                eps = 1e-16
+                fef_max = ant_max**2 / (empty_max**2 + eps)
+                fef_mean = ant_mean / (empty_mean + eps)
+                fef_center = ant_center**2 / (empty_center**2 + eps)
+
+                best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=empty_center)
+                best_freq = freqs[best_idx]
+                best_wavelength_nm = (1.0 / best_freq) * xm
+                warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
+                print(f"--> [{sub_name}] REZONANS: {best_wavelength_nm:.2f} nm "
+                      f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
+                      f"FEF_center = {fef_center[best_idx]:.2f}, "
+                      f"FEF_max_px = {fef_max[best_idx]:.2f}){warn}")
+
+                import matplotlib.pyplot as plt
+
+                wavelengths_nm = (1.0 / freqs) * xm
+
+                plt.figure(figsize=(8, 5))
+                plt.semilogy(wavelengths_nm, fef_mean, '-', color='darkred', linewidth=2, label='FEF mean (gap)')
+                plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre (peak pick)')
+                plt.semilogy(wavelengths_nm, fef_max, '--', color='gray', linewidth=1.5, label='FEF max pixel')
+                plt.plot(best_wavelength_nm, fef_center[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
+
+                plt.xlabel('Wavelength [nm]', fontsize=14)
+                plt.ylabel('Field Enhancement Factor (FEF)', fontsize=14)
+                plt.title(f'Split-bar / {sub_name}: L {p["L"]} nm, W {p["W"]} nm, gap {p["gap"]} nm', fontsize=13)
+                plt.grid(True, linestyle='--', alpha=0.7)
+                plt.legend(fontsize=12)
+                plt.tight_layout()
+
+                plot_filename = os.path.join("results", f"spectrum_splitbar_{sub_name}_gap_{p['gap']}nm_L_{p['L']}nm_W_{p['W']}nm.png")
+                plt.savefig(plot_filename, dpi=300)
+                plt.close()
+                print(f"Zapisano wykres widma: {plot_filename}")
+
+                with open(results_filename, "a") as f:
+                    f.write(f"{p['name']}\t{sub_name}\t{p['gap']}\t{p['L']}\t{p['W']}\t{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}\n")
+
+    if mp.am_master():
+        print_task(5, f" Wyniki zapisano w {results_filename}")
+    return 0
+
 def hybridbar_AuTiSiO2_opt():
 
     config = SimulationConfig()
