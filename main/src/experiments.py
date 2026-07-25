@@ -181,33 +181,8 @@ def hybridbar_calculate_resonant_peaks():
         TiBetween = HybridBar(gap=gap, bar_length=L_bar, tip_length=L_tip, width=width, thickness=Th_Ti, radius=radius, material=Ti, z_offset=-(Th_Au + Th_Ti)/2.0)
         
         substrate = mp.Block(size=mp.Vector3(L_Sub, W_Sub, Th_Sub), center=mp.Vector3(0, 0, -(Th_Au/2.0 + Th_Ti + Th_Sub/2.0)), material=SiO2)
-        
-        # Łaty pozostawione zgodnie z prośbą
-        hole_fix_1 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(24/xm, 0, 0),
-            material = Au,
-        )
 
-        hole_fix_2 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(-24/xm, 0, 0),
-            material = Au,
-        )
-
-        hole_fix_3 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
-        hole_fix_4 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(-24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
-        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate] + [hole_fix_1] + [hole_fix_2] + [hole_fix_3] + [hole_fix_4]
+        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate]
 
         config.pad = 200 / xm
         config.pml = 350 / xm
@@ -554,37 +529,13 @@ def hybridbar_AuTiSiO2_opt():
             radius=radius
         )
 
-        hole_fix_1 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(24/xm, 0, 0),
-            material = Au,
-        )
-
-        hole_fix_2 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(-24/xm, 0, 0),
-            material = Au,
-        )
-
-        hole_fix_3 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
-        hole_fix_4 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(-24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
         substrate = mp.Block(
                 size=mp.Vector3(L_Sub, W_Sub, Th_Sub),
                 center=mp.Vector3(0, 0, -(Th_Au/2.0 + Th_Ti + Th_Sub/2.0)),
                 material=SiO2
             )
         
-        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate] + [hole_fix_1] + [hole_fix_2] + [hole_fix_3] + [hole_fix_4]
+        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate]
 
         config.pad = 200/xm
         config.pml = 500/xm
@@ -779,31 +730,7 @@ def bowtie_calculate_resonant_peaks():
         AuTop = BowTie(gap=gap, length=L_tri, width=width, thickness=Th_Au, radius=radius, material=Au, z_offset=0.0)
         TiBetween = BowTie(gap=gap, length=L_tri, width=width, thickness=Th_Ti, radius=radius, material=Ti, z_offset=-(Th_Au + Th_Ti)/2.0)
         substrate = mp.Block(size=mp.Vector3(L_Sub, W_Sub, Th_Sub), center=mp.Vector3(0, 0, -(Th_Au/2.0 + Th_Ti + Th_Sub/2.0)), material=SiO2)
-        hole_fix_1 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(24/xm, 0, 0),
-            material = Au,
-        )
-
-        hole_fix_2 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(-24/xm, 0, 0),
-            material = Au,
-        )
-
-        hole_fix_3 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
-        hole_fix_4 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(-24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
-        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate] + [hole_fix_1] + [hole_fix_2] + [hole_fix_3] + [hole_fix_4]
+        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate]
 
         config.pad = 200 / xm
         config.pml = 350 / xm
@@ -969,37 +896,13 @@ def bowtie_AuTiSiO2_opt():
             z_offset=-(Th_Au + Th_Ti)/2.0
         )
 
-        hole_fix_1 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(24/xm, 0, 0),
-            material = Au,
-        )
-
-        hole_fix_2 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 30/xm),
-            center=mp.Vector3(-24/xm, 0, 0),
-            material = Au,
-        )
-
-        hole_fix_3 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
-        hole_fix_4 = mp.Block(
-            mp.Vector3(26/xm, 6/xm, 5/xm),
-            center=mp.Vector3(-24/xm, 0, -(Th_Au + Th_Ti)/2.0),
-            material = Ti,
-        )
-
         substrate = mp.Block(
                 size=mp.Vector3(L_Sub, W_Sub, Th_Sub),
                 center=mp.Vector3(0, 0, -(Th_Au/2.0 + Th_Ti + Th_Sub/2.0)),
                 material=SiO2
             )
         
-        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate] + [hole_fix_1] + [hole_fix_2] + [hole_fix_3] + [hole_fix_4]
+        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate]
 
         config.pad = 200/xm
         config.pml = 500/xm
@@ -2182,16 +2085,6 @@ def bowtie_substrate_experiment_MIR(material_name):
         material=Au,
         z_offset=0.0
     )
-    hole_fix_1 = mp.Block(
-        mp.Vector3(26/xm, 6/xm, 30/xm),
-        center=mp.Vector3(24/xm, 0, 0),
-        material=Au,
-    )
-    hole_fix_2 = mp.Block(
-        mp.Vector3(26/xm, 6/xm, 30/xm),
-        center=mp.Vector3(-24/xm, 0, 0),
-        material=Au,
-    )
     substrate = Bar(
         length=800/xm,
         width=800/xm,
@@ -2201,7 +2094,7 @@ def bowtie_substrate_experiment_MIR(material_name):
         radius=12/xm,
     )
 
-    geometry = AuTop.build_geometry() + substrate.build_geometry() + [hole_fix_1, hole_fix_2]
+    geometry = AuTop.build_geometry() + substrate.build_geometry()
 
     config.pad = 80/xm
     config.pml = 700/xm

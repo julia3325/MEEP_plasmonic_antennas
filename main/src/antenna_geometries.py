@@ -118,6 +118,10 @@ class HybridBar(AntennaBase):
                 antenna=self
             )
 
+            # Fill the axis hole left at the rounded apex (auto-scaled;
+            # replaces the old hard-coded hole_fix blocks in experiments.py)
+            geometry += tip_apex_patch(self)
+
         return geometry
 
     def bounding_box(self):
@@ -230,6 +234,10 @@ class BowTieEquilateral(AntennaBase):
                 points=[P1 * mirror, P2 * mirror, P3 * mirror],
                 antenna=self
             )
+
+            # Fill the axis hole left at the rounded apex (auto-scaled;
+            # replaces the old hard-coded hole_fix blocks in experiments.py)
+            bow_tie += tip_apex_patch(self)
 
         return bow_tie
 
@@ -349,6 +357,10 @@ class BowTie(AntennaBase):
                 points=[P1 * mirror, P2 * mirror, P3 * mirror],
                 antenna=self
             )
+
+            # Fill the axis hole left at the rounded apex (auto-scaled;
+            # replaces the old hard-coded hole_fix blocks in experiments.py)
+            bow_tie += tip_apex_patch(self)
 
         return bow_tie
 

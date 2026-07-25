@@ -320,3 +320,51 @@ def corrected_gap(g_target, R, theta):
         delta = R / np.sin(theta / 2.0) - R
         # print(f"Gap correction: For target gap {g_target*1e3:.2f} nm, radius {R*1e3:.1f} nm, and angle {np.rad2deg(theta):.1f} deg, the correction is {delta*1e3:.2f} nm.")
         return g_target - 2.0 * delta
+
+def tip_apex_patch(antenna, x_length=None, y_height=None, overlap=2/1000):
+    """
+    Fill the thin air sliver that opens along the symmetry axis at the
+    ROUNDED triangle apex of a HybridBar / BowTie tip.
+
+    This used to be done in experiments.py with mp.Block "hole_fix" patches
+    whose x-position (24 nm), size (26x6 nm) and z-size were HARD-CODED for
+    a single case (gap 30 nm, W 240 nm, tip 150 nm). Here everything is
+    derived from the antenna object, so the patch follows the tip for ANY
+    gap / width / tip angle and for either metal layer (Au or Ti):
+
+        x-centre = antenna.corected_gap        (24 nm for the old case;
+                   corected_gap already folds in the radius correction)
+        x-length = corected_gap + overlap      (~26 nm)   [override x_length]
+        y-height = 1.2 * radius, min 4 nm       (~6 nm)    [override y_height]
+        z-size   = antenna.thickness           (30 nm Au / 5 nm Ti)
+        z-centre = antenna.z_offset            (layer position)
+        material = antenna.material
+
+    Call it ONLY when antenna.radius > 0 (no rounding -> no hole), and AFTER
+    antenna.corected_gap has been computed inside build_geometry().
+
+    NOTE: this is a numerical patch, not exact geometry. After a large change
+    of gap/tip, verify visually with save_2D_plot that the hole is filled and
+    the patch does not eat into the gap.
+
+    Returns [right_patch, left_patch] (two mp.Block).
+    """
+    xc = antenna.corected_gap
+    x0, y0 = antenna.center
+    if x_length is None:
+        x_length = antenna.corected_gap + overlap
+    if y_height is None:
+        y_height = max(1.2 * antenna.radius, 4/1000)
+
+    return [
+        mp.Block(
+            mp.Vector3(x_length, y_height, antenna.thickness),
+            center=mp.Vector3(x0 + xc, y0, antenna.z_offset),
+            material=antenna.material,
+        ),
+        mp.Block(
+            mp.Vector3(x_length, y_height, antenna.thickness),
+            center=mp.Vector3(x0 - xc, y0, antenna.z_offset),
+            material=antenna.material,
+        ),
+    ]
