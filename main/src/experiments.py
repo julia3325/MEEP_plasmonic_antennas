@@ -48,16 +48,27 @@ def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1):
     returned `at_boundary` flag marks geometries whose best point sits at
     the window edge (true resonance likely outside the laser band).
 
+    Sub-bin refinement (`delta`): the DFT frequency grid is discrete, so
+    argmax alone snaps the peak to the nearest bin (~24-28 nm apart near
+    8 um). Two geometries with sub-bin resonance shifts then report the
+    EXACT same wavelength. To recover a continuous peak position we fit a
+    parabola to the three samples around the winning bin and return the
+    offset `delta` in (-0.5, +0.5] bins. The caller converts it to a
+    frequency with:  best_freq = freqs[idx] + delta * (freqs[1] - freqs[0]).
+    delta = 0 whenever the peak is at an edge or the local shape is not
+    concave (no well-defined interior maximum).
+
     Returns
     -------
-    (idx, at_boundary) : (int, bool)
+    (idx, at_boundary, delta) : (int, bool, float)
     """
     n = len(spectrum)
     g = min(edge_guard, n // 2)
     lo, hi = g, n - g  # search range [lo, hi)
 
+    spec = np.asarray(spectrum, dtype=float)
     search = np.full(n, -np.inf)
-    search[lo:hi] = np.asarray(spectrum[lo:hi], dtype=float)
+    search[lo:hi] = spec[lo:hi]
 
     if ref is not None:
         ref = np.asarray(ref, dtype=float)
@@ -70,7 +81,17 @@ def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1):
     idx = int(np.argmax(search))
     # flag if the chosen point is at (or right next to) either window edge
     at_boundary = (idx <= lo + 1) or (idx >= hi - 2)
-    return idx, at_boundary
+
+    # parabolic sub-bin peak offset from the three raw samples around idx
+    delta = 0.0
+    if 0 < idx < n - 1:
+        ym1, y0, yp1 = spec[idx - 1], spec[idx], spec[idx + 1]
+        denom = ym1 - 2.0 * y0 + yp1
+        if denom < 0.0:  # concave -> genuine local maximum
+            d = 0.5 * (ym1 - yp1) / denom
+            if -0.5 < d <= 0.5:
+                delta = float(d)
+    return idx, at_boundary, delta
 
 def _dft_gap_spectra(sim, dft_box, dft_inner, dft_center, nfreq, comm, MPI):
     """
@@ -116,6 +137,94 @@ def _dft_gap_spectra(sim, dft_box, dft_inner, dft_center, nfreq, comm, MPI):
 
     return max_amp, mean_int, center_amp
 
+def check_antenna_geometry(kind="hybridbar", gap=30, W=240, L_bar=1800, L_tip=150,
+                           length=1100, radius=5, resolution=800,
+                           with_substrate=True, view_nm=None,
+                           out_dir="results/geom_check"):
+    """
+    Parameters:
+
+    kind : "hybridbar" | "bowtie"
+    gap, W, L_bar, L_tip, length, radius : geometry in nm (length = bow-tie
+        triangle length; L_bar/L_tip = hybrid bar/tip). 
+    with_substrate : include the SiO2 block
+    view_nm : full width of the square XY view [nm]; None -> auto around gap.
+    out_dir : where the PNGs are written.
+
+    Writes (per call): geom_<kind>_gap<g>_XY.png, _XYzoom.png, _XZ.png
+    """
+
+    Th_Au = 30 / xm
+    Th_Ti = 5 / xm
+    Th_Sub = 100 / xm
+    g = gap / xm
+    r = radius / xm
+
+    if kind == "hybridbar":
+        tag = f"hybrid_gap{gap}_Lbar{L_bar}_Ltip{L_tip}_W{W}"
+        AuTop = HybridBar(gap=g, bar_length=L_bar/xm, tip_length=L_tip/xm,
+                          width=W/xm, thickness=Th_Au, radius=r, material=Au, z_offset=0.0)
+        TiBetween = HybridBar(gap=g, bar_length=L_bar/xm, tip_length=L_tip/xm,
+                              width=W/xm, thickness=Th_Ti, radius=r, material=Ti,
+                              z_offset=-(Th_Au + Th_Ti)/2.0)
+        tip_reach_nm = L_tip
+    elif kind == "bowtie":
+        tag = f"bowtie_gap{gap}_L{length}_W{W}"
+        AuTop = BowTie(gap=g, length=length/xm, width=W/xm, thickness=Th_Au,
+                       radius=r, material=Au, z_offset=0.0)
+        TiBetween = BowTie(gap=g, length=length/xm, width=W/xm, thickness=Th_Ti,
+                           radius=r, material=Ti, z_offset=-(Th_Au + Th_Ti)/2.0)
+        tip_reach_nm = length
+    else:
+        raise ValueError("kind must be 'hybridbar' or 'bowtie'")
+
+    geometry = AuTop.build_geometry() + TiBetween.build_geometry()
+
+    # view: square window centred on the gap. Default shows the whole tip
+    # (hybrid) or ~800 nm around the apex (bow-tie is huge, only apex matters).
+    if view_nm is None:
+        view_nm = 2 * (tip_reach_nm + gap) + 200 if kind == "hybridbar" else 800
+    view = view_nm / xm
+    z_ext = (Th_Au + Th_Ti + Th_Sub) + 160/xm
+
+    if with_substrate:
+        # substrate spans the view so it forms a clean background
+        substrate = mp.Block(size=mp.Vector3(view + 400/xm, view + 400/xm, Th_Sub),
+                             center=mp.Vector3(0, 0, -(Th_Au/2.0 + Th_Ti + Th_Sub/2.0)),
+                             material=SiO2)
+        geometry = geometry + [substrate]
+
+    cell = mp.Vector3(view, view, z_ext)
+    sim = mp.Simulation(cell_size=cell, boundary_layers=[], geometry=geometry,
+                        resolution=resolution, dimensions=3)
+
+    if mp.am_master():
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"[geom-check] {tag}")
+        print(f"  gap = {gap} nm   corrected_gap (Au) = {AuTop.corected_gap*xm:.2f} nm"
+              f"   radius = {radius} nm")
+        if radius > 0:
+            patch_xc = AuTop.corected_gap * xm
+            patch_len = (AuTop.corected_gap + 2/1000) * xm
+            patch_h = max(1.2 * r, 4/1000) * xm
+            print(f"  tip_apex_patch: x-centre = +-{patch_xc:.2f} nm,"
+                  f" size = {patch_len:.2f} x {patch_h:.2f} nm"
+                  f"   (patch inner edge at x = {patch_xc - patch_len/2:.2f} nm,"
+                  f" gap wall at x = {gap/2:.2f} nm)")
+
+    save_2D_plot(sim, mp.Volume(center=mp.Vector3(0, 0, 0), size=mp.Vector3(view, view, 0)),
+                 save_name=f"geom_{tag}_XY.png", IMG_CLOSE=True, path_to_save=out_dir)
+    zoom = min(view, (2 * (L_tip if kind == "hybridbar" else 120) + 2 * gap) / xm)
+    save_2D_plot(sim, mp.Volume(center=mp.Vector3(0, 0, 0), size=mp.Vector3(zoom, zoom, 0)),
+                 save_name=f"geom_{tag}_XYzoom.png", IMG_CLOSE=True, path_to_save=out_dir)
+    save_2D_plot(sim, mp.Volume(center=mp.Vector3(0, 0, 0), size=mp.Vector3(view, 0, z_ext)),
+                 save_name=f"geom_{tag}_XZ.png", IMG_CLOSE=True, path_to_save=out_dir)
+
+    sim.reset_meep()
+    if mp.am_master():
+        print(f"  -> saved geom_{tag}_XY.png / _XYzoom.png / _XZ.png in {out_dir}/")
+    return 0
+
 def hybridbar_calculate_resonant_peaks():
     config = SimulationConfig()
 
@@ -129,29 +238,36 @@ def hybridbar_calculate_resonant_peaks():
     df = fmax - fmin
 
     center_wavelength_nm = (1.0 / fcen) * xm  # około 7338.7 nm
-    nfreq = 200
+    nfreq = 400
 
-    config.resolution = 350
+    config.resolution = 200
     config.lambda0 = center_wavelength_nm / xm
-    # fwidth MUST be broad enough that the empty (reference) field has good
-    # SNR across the WHOLE scanned band, otherwise ant/empty blows up at the
-    # band edges (division by a near-zero reference) and the peak pins to the
-    # bluest point for every geometry. 6*df reproduces the old working source
-    # (old code used df*lambda0 ~ 7*df). The envelope cancels in the ratio.
     config.frequency_width = 6.0 * df
 
-    sweeps = [
-        # {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_2", "gap": 30, "L_bar": 1800, "L_tip": 150, "W": 240},
+    sweeps = [ 
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 240},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 280},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 280},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 200, "W": 240},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 100, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 280},
+        # {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 280},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 200, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 100, "W": 240},
+        # {"name": "HybridBar_2", "gap": 30, "L_bar": 1800, "L_tip": 150, "W": 280},
+        # {"name": "HybridBar_2", "gap": 30, "L_bar": 1800, "L_tip": 100, "W": 240},
+        # {"name": "HybridBar_2", "gap": 30, "L_bar": 1800, "L_tip": 200, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2000, "L_tip": 150, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 240},
+        {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 200, "W": 240},
+        {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 200, "W": 240},
+        {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 280},
+        {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 280},
+        # Not yet:
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 200},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 200},
         
     ]
 
-    results_filename = "results/resonant_peaks_summary.txt"
+    results_filename = "results/resonant_peaks_hybrid_summary3.txt"
     if not os.path.exists("results") and mp.am_master():
         os.makedirs("results")
         
@@ -250,8 +366,11 @@ def hybridbar_calculate_resonant_peaks():
             # dipolar gap resonance cleanly, unlike the gap-averaged one
             # whose rising short-wavelength background pushes argmax to the
             # window edge. Interior local-max search avoids boundary pinning.
-            best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=empty_center)
-            best_freq = freqs[best_idx]
+            best_idx, at_boundary, delta = _pick_resonance_idx(fef_center, ref=empty_center)
+            # sub-bin interpolated peak: shift the winning bin by the parabolic
+            # offset so geometries closer than one DFT bin no longer collapse
+            # onto an identical reported wavelength
+            best_freq = freqs[best_idx] + delta * (freqs[1] - freqs[0])
             best_wavelength_nm = (1.0 / best_freq) * xm
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
@@ -276,7 +395,7 @@ def hybridbar_calculate_resonant_peaks():
             plt.legend(fontsize=12)
             plt.tight_layout()
 
-            plot_filename = os.path.join("results", f"spectrum_gap_{p['gap']}nm_Lbar_{p['L_bar']}nm_Ltip_{p['L_tip']}nm_W_{p['W']}nm.png")
+            plot_filename = os.path.join("results", f"spectrum_gap_{p['gap']}nm_Lbar_{p['L_bar']}nm_Ltip_{p['L_tip']}nm_W_{p['W']}nm_CHECK4.png")
             plt.savefig(plot_filename, dpi=300)
             plt.close()
             print(f"Zapisano wykres widma: {plot_filename}")
@@ -290,18 +409,13 @@ def hybridbar_calculate_resonant_peaks():
 
 def splitbar_calculate_resonant_peaks():
     """
-    Resonant-wavelength scan for the SPLIT-BAR antenna (two plain rectangular
-    bars, NO triangular tips), repeated for TWO substrates: SiO2 and Si.
+    Resonant-wavelength scan for the SPLIT-BAR antenna, repeated for TWO substrates: SiO2 and Si.
 
     Same method as hybridbar_calculate_resonant_peaks: one broadband pulse +
     converged DFT (stop_when_dft_decayed), FEF = |E_ant|^2/|E_empty|^2 in the
     gap, peak position taken from the gap-centre spectrum. For every geometry
     the scan runs once per substrate, so you can read off the substrate shift
     directly (Si has a much higher index than SiO2 -> strong RED-shift).
-
-    sweeps dict keys: name, gap, L, W
-        L = length of ONE bar arm; the full dipole span is 2*L + gap.
-        (No L_tip - a split bar has no tips.)
     """
     config = SimulationConfig()
 
@@ -315,18 +429,14 @@ def splitbar_calculate_resonant_peaks():
     df = fmax - fmin
 
     center_wavelength_nm = (1.0 / fcen) * xm
-    nfreq = 200
+    nfreq = 400 
 
     config.resolution = 350   # lower to ~200-250 for screening
     config.lambda0 = center_wavelength_nm / xm
     config.frequency_width = 6.0 * df   # broad source; cancels in the ratio
 
     # Substrates to scan: (label, meep material). Si = crystalline silicon
-    # (cSi). NOTE: the paper's p++ Si is doped (extra free-carrier loss) and
-    # sits under a 300 nm SiO2 spacer - to reproduce it exactly, stack Si with
-    # a thin SiO2 layer here. Also, the antenna near-field penetrates deeper
-    # than the 100 nm Th_Sub below; for a full high-index-substrate effect
-    # increase Th_Sub (a thin Si layer underestimates the red-shift).
+    # (cSi). 
     substrates = [
         ("SiO2", SiO2),
         ("Si",   cSi),
@@ -334,7 +444,6 @@ def splitbar_calculate_resonant_peaks():
 
     sweeps = [
         {"name": "SplitBar", "gap": 20, "L": 1800, "W": 240},
-        # {"name": "SplitBar", "gap": 20, "L": 890,  "W": 240},  # ~1.8 um TOTAL dipole (paper L1)
     ]
 
     results_filename = "results/resonant_peaks_splitbar_summary.txt"
@@ -427,8 +536,9 @@ def splitbar_calculate_resonant_peaks():
                 fef_mean = ant_mean / (empty_mean + eps)
                 fef_center = ant_center**2 / (empty_center**2 + eps)
 
-                best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=empty_center)
-                best_freq = freqs[best_idx]
+                best_idx, at_boundary, delta = _pick_resonance_idx(fef_center, ref=empty_center)
+                # sub-bin interpolated peak (see note at the other call sites)
+                best_freq = freqs[best_idx] + delta * (freqs[1] - freqs[0])
                 best_wavelength_nm = (1.0 / best_freq) * xm
                 warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
                 print(f"--> [{sub_name}] REZONANS: {best_wavelength_nm:.2f} nm "
@@ -675,7 +785,8 @@ def bowtie_calculate_resonant_peaks():
     df = fmax - fmin
 
     center_wavelength_nm = (1.0 / fcen) * xm  # około 7338.7 nm
-    nfreq = 200
+    nfreq = 400  # DFT bins are cheap (no extra sim time); finer grid + parabolic
+                 # sub-bin fit in _pick_resonance_idx resolves peaks < 1 old bin apart
 
     config.resolution = 350
     config.lambda0 = center_wavelength_nm / xm
@@ -798,8 +909,11 @@ def bowtie_calculate_resonant_peaks():
             # dipolar gap resonance cleanly, unlike the gap-averaged one
             # whose rising short-wavelength background pushes argmax to the
             # window edge. Interior local-max search avoids boundary pinning.
-            best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=empty_center)
-            best_freq = freqs[best_idx]
+            best_idx, at_boundary, delta = _pick_resonance_idx(fef_center, ref=empty_center)
+            # sub-bin interpolated peak: shift the winning bin by the parabolic
+            # offset so geometries closer than one DFT bin no longer collapse
+            # onto an identical reported wavelength
+            best_freq = freqs[best_idx] + delta * (freqs[1] - freqs[0])
             best_wavelength_nm = (1.0 / best_freq) * xm
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
