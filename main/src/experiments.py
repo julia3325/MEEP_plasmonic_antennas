@@ -248,6 +248,7 @@ def hybridbar_calculate_resonant_peaks():
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 240},
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 280},
         # {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 240},
+        {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 140},
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 280},
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 200, "W": 240},
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 100, "W": 240},
@@ -257,17 +258,26 @@ def hybridbar_calculate_resonant_peaks():
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 2000, "L_tip": 150, "W": 240},
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 240},
         # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 240},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 200, "W": 240},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 200, "W": 240},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 280},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 280},
-        # Not yet:
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 200},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 200},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 200, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 200, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 280},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 280},
+        {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 300, "W": 160},
+       
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 50, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 250, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 300, "W": 240},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 160},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 200},
+        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 320},
+        # {"name": "HybridBar_3", "gap": 50, "L_bar": 1600, "L_tip": 150, "W": 240},
+        # {"name": "HybridBar_3", "gap": 70, "L_bar": 1600, "L_tip": 150, "W": 240},
+        # {"name": "HybridBar_3", "gap": 90, "L_bar": 1600, "L_tip": 150, "W": 240},
+        # {"name": "HybridBar_3", "gap": 10, "L_bar": 1600, "L_tip": 150, "W": 240},
         
     ]
 
-    results_filename = "results/resonant_peaks_hybrid_summary3.txt"
+    results_filename = "results/resonant_peaks_hybrid_summary6.txt"
     if not os.path.exists("results") and mp.am_master():
         os.makedirs("results")
         
@@ -581,11 +591,11 @@ def hybridbar_AuTiSiO2_opt():
     config.IMG_CLOSE = True
 
     tasks = [
-        {"gap": 30, "L_bar": 1400, "L_tip": 150,  "W": 280, "Wavelength": 6928.36},
-        {"gap": 30, "L_bar": 1600, "L_tip": 150,  "W": 280, "Wavelength": 9784.18},
-        {"gap": 30, "L_bar": 1600, "L_tip": 200,  "W": 240, "Wavelength": 10300},
-        {"gap": 30, "L_bar": 1800, "L_tip": 150,  "W": 240, "Wavelength": 10300},
-        {"gap": 30, "L_bar": 1600, "L_tip": 100,  "W": 240, "Wavelength": 9421.25},
+        {"gap": 30, "L_bar": 2400, "L_tip": 200,  "W": 240, "Wavelength": 8476.11},
+        # {"gap": 30, "L_bar": 1600, "L_tip": 150,  "W": 280, "Wavelength": 9784.18},
+        # {"gap": 30, "L_bar": 1600, "L_tip": 200,  "W": 240, "Wavelength": 10300},
+        # {"gap": 30, "L_bar": 1800, "L_tip": 150,  "W": 240, "Wavelength": 10300},
+        # {"gap": 30, "L_bar": 1600, "L_tip": 100,  "W": 240, "Wavelength": 9421.25},
         #{"gap": 30, "L_bar": 1600, "L_tip": 200,  "W": 240, "Wavelength": 10300},
         #{"gap": 30, "L_bar": 1200, "L_tip": 150,  "W": 240, "Wavelength": 6340}, 
     ]
@@ -594,7 +604,7 @@ def hybridbar_AuTiSiO2_opt():
 
         plt.close('all')
 
-        config.resolution = 350
+        config.resolution = 300
         config.sim_time = 12000 / xm      # unused by DFT maps (kept for other utils)
         config.sim_time_step = 50 / xm
         config.lambda0 = p["Wavelength"] / xm
@@ -785,34 +795,32 @@ def bowtie_calculate_resonant_peaks():
     df = fmax - fmin
 
     center_wavelength_nm = (1.0 / fcen) * xm  # około 7338.7 nm
-    nfreq = 400  # DFT bins are cheap (no extra sim time); finer grid + parabolic
-                 # sub-bin fit in _pick_resonance_idx resolves peaks < 1 old bin apart
+    nfreq = 400
 
-    config.resolution = 350
+
+    config.resolution = 200
     config.lambda0 = center_wavelength_nm / xm
-    # fwidth MUST be broad enough that the empty (reference) field has good
-    # SNR across the WHOLE scanned band, otherwise ant/empty blows up at the
-    # band edges (division by a near-zero reference) and the peak pins to the
-    # bluest point for every geometry. 6*df reproduces the old working source
-    # (old code used df*lambda0 ~ 7*df). The envelope cancels in the ratio.
     config.frequency_width = 6.0 * df
 
     sweeps = [
-        # {"name": "BowTie_L300", "gap": 30, "L": 300, "W": 300},
-        # {"name": "BowTie_L400", "gap": 30, "L": 400, "W": 300},
-        # {"name": "BowTie_L500", "gap": 30, "L": 500, "W": 300},
-        # {"name": "BowTie_L300", "gap": 30, "L": 150, "W": 300},
-        # {"name": "BowTie_W400", "gap": 30, "L": 500, "W": 400},
-        # {"name": "BowTie_W500", "gap": 30, "L": 500, "W": 500},
-        # {"name": "BowTie_L1000_W800", "gap": 30, "L": 1000, "W": 800},
-        # {"name": "BowTie_L1000_W1000", "gap": 30, "L": 1000, "W": 1000},
-        # {"name": "BowTie_L900_W800", "gap": 30, "L": 900, "W": 800},
-        {"name": "BowTie_L1100_W800", "gap": 30, "L": 1100, "W": 800},
-        {"name": "BowTie_L1100_W900", "gap": 30, "L": 1100, "W": 900},
-        {"name": "BowTie_L1100_W900", "gap": 30, "L": 1100, "W": 1000},
+        # {"name": "BowTie4", "gap": 30, "L": 500, "W": 300},
+        # {"name": "BowTie4", "gap": 30, "L": 150, "W": 300},
+        # {"name": "BowTie4", "gap": 30, "L": 300, "W": 300},
+        # {"name": "BowTie4", "gap": 30, "L": 700, "W": 300},
+        # {"name": "BowTie4", "gap": 30, "L": 900, "W": 300},
+        # {"name": "BowTie4", "gap": 30, "L": 500, "W": 200},
+        # {"name": "BowTie4", "gap": 30, "L": 500, "W": 400},
+        # {"name": "BowTie4", "gap": 30, "L": 500, "W": 500},
+        # {"name": "BowTie4", "gap": 30, "L": 500, "W": 700},
+        # {"name": "BowTie4", "gap": 50, "L": 500, "W": 300},
+        # {"name": "BowTie4", "gap": 70, "L": 500, "W": 300},
+        # {"name": "BowTie4", "gap": 90, "L": 500, "W": 300},
+        # {"name": "BowTie4", "gap": 10, "L": 500, "W": 300},
+        {"name": "BowTie4", "gap": 30, "L": 1000, "W": 1000},
+
     ]
 
-    results_filename = "results/resonant_peaks_summary.txt"
+    results_filename = "results/resonant_peaks_bowtie_summary2.txt"
     if not os.path.exists("results") and mp.am_master():
         os.makedirs("results")
         
@@ -832,8 +840,6 @@ def bowtie_calculate_resonant_peaks():
         Th_Au = 30 / xm
         Th_Ti = 5 / xm
         Th_Sub = 100 / xm
-        # BUGFIX: previously referenced p["L_bar"] etc. (leftover from the
-        # hybridbar loop variable); bowtie total length = 2*L + gap
         L_Sub = (params["gap"] + 2 * params["L"] + 400)/xm
         W_Sub = (params["W"] + 400)/xm
         radius = 5 / xm
@@ -938,7 +944,7 @@ def bowtie_calculate_resonant_peaks():
             plt.legend(fontsize=12)
             plt.tight_layout()
 
-            plot_filename = os.path.join("results", f"spectrum_gap_{params['gap']}nm_L_{params['L']}nm_W_{params['W']}nm.png")
+            plot_filename = os.path.join("results", f"spectrum_BowTie_gap_{params['gap']}nm_L_{params['L']}nm_W_{params['W']}nm_CHECK4.png")
             plt.savefig(plot_filename, dpi=300)
             plt.close()
             print(f"Zapisano wykres widma: {plot_filename}")

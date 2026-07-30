@@ -9,10 +9,10 @@ def run():
     # default values
     # mode = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     # material_name = sys.argv[2] if len(sys.argv) > 2 else "air"
-    mode = 6
+    mode = 1
 
     if mode == 1:
-        calculate_resonant_peaks()
+        bowtie_calculate_resonant_peaks()
 
     elif mode == 2:
         bowtie_AuTiSiO2_opt()
