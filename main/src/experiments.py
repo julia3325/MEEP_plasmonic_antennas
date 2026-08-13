@@ -514,37 +514,16 @@ def hybridbar_calculate_resonant_peaks():
     config.lambda0 = center_wavelength_nm / xm
     config.frequency_width = 6.0 * df
 
-    sweeps = [ 
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1400, "L_tip": 150, "W": 280},
-        # {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 240},
-        {"name": "HybridBar_1", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 140},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 280},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 200, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 100, "W": 240},
-        # {"name": "HybridBar_2", "gap": 30, "L_bar": 1800, "L_tip": 150, "W": 280},
-        # {"name": "HybridBar_2", "gap": 30, "L_bar": 1800, "L_tip": 100, "W": 240},
-        # {"name": "HybridBar_2", "gap": 30, "L_bar": 1800, "L_tip": 200, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2000, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 200, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 200, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2200, "L_tip": 150, "W": 280},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 150, "W": 280},
-        {"name": "HybridBar_3", "gap": 30, "L_bar": 2400, "L_tip": 300, "W": 160},
-       
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 50, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 250, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 300, "W": 240},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 160},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 200},
-        # {"name": "HybridBar_3", "gap": 30, "L_bar": 1600, "L_tip": 150, "W": 320},
-        # {"name": "HybridBar_3", "gap": 50, "L_bar": 1600, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_3", "gap": 70, "L_bar": 1600, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_3", "gap": 90, "L_bar": 1600, "L_tip": 150, "W": 240},
-        # {"name": "HybridBar_3", "gap": 10, "L_bar": 1600, "L_tip": 150, "W": 240},
-        
+    # Resolution convergence test: SAME geometry (gap=30, L_bar=2000,
+    # L_tip=150, W=240) run at 200/250/300/350. With radius=0 the geometry is
+    # mathematically identical at every resolution, so any shift in the
+    # resonant wavelength is purely numerical convergence (not a change of the
+    # simulated corner shape). Per-sweep "res" overrides config.resolution.
+    sweeps = [
+        {"name": "conv_res200", "gap": 30, "L_bar": 2000, "L_tip": 150, "W": 240, "res": 200},
+        {"name": "conv_res250", "gap": 30, "L_bar": 2000, "L_tip": 150, "W": 240, "res": 250},
+        {"name": "conv_res300", "gap": 30, "L_bar": 2000, "L_tip": 150, "W": 240, "res": 300},
+        {"name": "conv_res350", "gap": 30, "L_bar": 2000, "L_tip": 150, "W": 240, "res": 350},
     ]
 
     results_filename = "results/resonant_peaks_hybrid_summary6.txt"
@@ -556,8 +535,11 @@ def hybridbar_calculate_resonant_peaks():
     freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
 
     for p in sweeps:
-        mp.print_messages = False 
+        mp.print_messages = False
         print_task(1, f"Szukanie rezonansu dla: {p['name']}")
+
+        # per-sweep resolution override (falls back to the module default above)
+        config.resolution = p.get("res", config.resolution)
 
         L_bar = p["L_bar"] / xm
         L_tip = p["L_tip"] / xm
