@@ -19,6 +19,77 @@ mp.Simulation.eps_averaging = False
 DFT_DECAY_TOL = 1e-6
 DFT_MAX_RUN_TIME = 800.0  # [Meep time units]
 
+# --- tip sharpness / gap validity ------------------------------------------
+# ROOT CAUSE of the inconsistent rows in resonant_peaks_hybrid_summary1.txt
+# (gap=30 with L_tip=250/300, W=140, and the L_tip=300/W=160 row):
+#
+#   corrected_gap(g, R, theta) = g - 2*(R/sin(theta/2) - R),  theta = tip angle
+#
+# is the gap to use in the SHARP geometry so that, after filleting with radius
+# R, the effective gap comes out as g. For a sharp tip (narrow W, long L_tip)
+# theta gets small, 1/sin(theta/2) blows up, and the correction eats the whole
+# gap. Measured on the summary1 geometries (gap=30 nm, R=5 nm):
+#
+#   W=240 L_tip=150 -> 23.99 nm   (the design point, clean)
+#   W=140 L_tip=150 -> 16.35 nm   \
+#   W=240 L_tip=250 -> 16.89 nm    |  every anomalous row in the file
+#   W=240 L_tip=300 -> 13.07 nm    |
+#   W=160 L_tip=300 ->  1.19 nm   /   (a QUARTER of a pixel at resolution 200)
+#
+# The four broken rows are exactly the four smallest corrected gaps, and the
+# cut is sharp: everything at 18.75 nm and above is self-consistent. At 1.19 nm
+# the tips are effectively shorted on the grid, which is why that row reports
+# FEF_center 10x BELOW FEF_mean.
+#
+# Every row in that file was produced AFTER 46ae533, i.e. with the auto-scaled
+# tip_apex_patch, so the apex patch was placed correctly and is NOT the cause.
+# What remains is the correction formula itself, and one thing it cannot know:
+# R = 5 nm is a SINGLE pixel at resolution 200. A 5 nm fillet is simply not
+# representable on a 5 nm grid, so the "effective gap becomes g after
+# filleting" premise fails - and since delta ~ 1/sin(theta/2), the error is
+# amplified exactly as the tip gets sharper. Hence a guard on both.
+MIN_CORRECTED_GAP_FRAC = 0.6   # corrected gap must keep >=60% of the target gap
+MIN_CORRECTED_GAP_PIXELS = 4   # ...and still span >=4 pixels
+MIN_RADIUS_PIXELS = 2          # fillet radius must be resolved by the grid
+
+# Tip fillet radius [nm] for the resonance SCANS. 0 = sharp tip: corected_gap
+# collapses to gap, no apex patch, geometry is exactly what was requested.
+# Set back to 5 only together with a resolution that resolves it (>=800, where
+# R = 4 px) - at 200 a 5 nm fillet is a single pixel and is pure cost.
+TIP_RADIUS_NM = 0.0
+
+# --- gap probe geometry ----------------------------------------------------
+# Separate latent issue found while chasing the above, not the cause of it:
+# inner_gap used to be   max(gap - 4.0/config.resolution, 0.4*gap),
+# so the volume FEF_mean averages over was a function of the RESOLUTION - at
+# gap=30 nm it ran from 12 nm (res 200) to 25 nm (res 800). |E|^2 climbs
+# steeply towards the metal walls, so the same antenna measured at two
+# resolutions returns two different FEF_mean values. Every row in summary1 was
+# run at resolution 200, so this did not affect that file - but it silently
+# breaks any screening(200) vs showcase(400) comparison, and it means the mean
+# does not actually converge. The volume is now a fixed fraction of the gap;
+# resolution controls only how well that fixed volume is sampled.
+INNER_GAP_FRACTION = 0.4     # inner box width = 0.4 * gap, resolution-free
+MIN_INNER_PIXELS = 3         # warn below this many pixels across the inner box
+# The gap-centre probe was a ZERO-SIZE dft_fields region: one raw Yee sample,
+# sitting on BOTH mirror-symmetry planes, with eps_averaging off. It is the
+# probe that reported FEF_max_px < FEF_center - structurally impossible, since
+# the max is taken over a box that CONTAINS the centre point. Now a small box,
+# reduced as mean |Ex|^2 like the inner-gap mean, so no single pixel dominates.
+CENTER_PROBE_PIXELS = 2      # half-width of the centre box, in pixels
+
+# --- peak picking ----------------------------------------------------------
+# Median filter width [bins], applied ONLY to the spectrum used for peak
+# PICKING - never to the reported values. At nfreq=400 over 5700-10300 nm the
+# bins sit ~7 nm apart near 6 um, while a Q~20 resonance there is ~300 nm wide
+# (~40 bins), so a 5-bin median cannot move a genuine peak. This is a cheap
+# guard against single-bin artefacts, NOT the fix for the rows above - their
+# spectra are smooth and single-peaked; the volume was the problem.
+PEAK_PICK_MEDIAN_BINS = 5
+# Flag a picked bin whose raw value stands this far above the median-filtered
+# spectrum: that is a spike, not a resonance.
+SPIKE_FLAG_RATIO = 1.5
+
 def _get_mpi_comm():
     try:
         from mpi4py import MPI
@@ -26,7 +97,30 @@ def _get_mpi_comm():
     except ImportError:
         return None, None
 
-def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1):
+def _median_filter(y, width):
+    """
+    Odd-width running median with edge padding. numpy only - scipy is not
+    guaranteed to be in the cluster environment.
+    """
+    y = np.asarray(y, dtype=float)
+    w = int(width)
+    if w < 3 or y.size < 3:
+        return y.copy()
+    if w % 2 == 0:
+        w += 1
+    w = min(w, y.size if y.size % 2 else y.size - 1)
+    h = w // 2
+    pad = np.pad(y, h, mode="edge")
+    try:
+        win = np.lib.stride_tricks.sliding_window_view(pad, w)
+        return np.median(win, axis=-1)
+    except AttributeError:          # numpy < 1.20
+        return np.array([np.median(pad[i:i + w]) for i in range(y.size)])
+
+
+
+def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1,
+                        smooth=PEAK_PICK_MEDIAN_BINS):
     """
     Pick the wavelength of MAXIMUM in-band enhancement.
 
@@ -48,27 +142,31 @@ def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1):
     returned `at_boundary` flag marks geometries whose best point sits at
     the window edge (true resonance likely outside the laser band).
 
-    Sub-bin refinement (`delta`): the DFT frequency grid is discrete, so
-    argmax alone snaps the peak to the nearest bin (~24-28 nm apart near
-    8 um). Two geometries with sub-bin resonance shifts then report the
-    EXACT same wavelength. To recover a continuous peak position we fit a
-    parabola to the three samples around the winning bin and return the
-    offset `delta` in (-0.5, +0.5] bins. The caller converts it to a
-    frequency with:  best_freq = freqs[idx] + delta * (freqs[1] - freqs[0]).
-    delta = 0 whenever the peak is at an edge or the local shape is not
-    concave (no well-defined interior maximum).
+    Spike rejection (`smooth`): argmax over the RAW spectrum lets a single bad
+    bin win. That is what corrupted the (1600,150,140), (1600,250,240) and
+    (1600,300,240) rows of summary1.txt - and because every FEF is then read at
+    that bin, lambda_res and FEF_mean were wrong too, not only FEF_center. The
+    peak is therefore picked on a median-filtered copy, then snapped back to the
+    local RAW maximum so the filter itself cannot shift the answer. See
+    PEAK_PICK_MEDIAN_BINS for why the width is safe.
+
+    NOTE: the parabolic sub-bin refinement was removed on purpose - resolution
+    in lambda now comes from nfreq alone (500 bins over 5700-10300 nm, i.e.
+    ~5.1 nm near 5.7 um and ~16.5 nm near 10.3 um). Geometries whose resonances
+    differ by less than one bin therefore report the SAME wavelength again.
 
     Returns
     -------
-    (idx, at_boundary, delta) : (int, bool, float)
+    (idx, at_boundary) : (int, bool)
     """
     n = len(spectrum)
     g = min(edge_guard, n // 2)
     lo, hi = g, n - g  # search range [lo, hi)
 
     spec = np.asarray(spectrum, dtype=float)
+    picked_on = _median_filter(spec, smooth) if smooth else spec
     search = np.full(n, -np.inf)
-    search[lo:hi] = spec[lo:hi]
+    search[lo:hi] = picked_on[lo:hi]
 
     if ref is not None:
         ref = np.asarray(ref, dtype=float)
@@ -79,19 +177,88 @@ def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1):
             search[low_snr] = -np.inf
 
     idx = int(np.argmax(search))
+    # The median filter can bias the argmax by ~1 bin even on a clean peak, so
+    # snap back to the local RAW maximum within the filter half-width. Spike
+    # rejection is kept (the spike is outside this neighbourhood), the bias is
+    # not.
+    if smooth and smooth >= 3:
+        h = int(smooth) // 2
+        a, b = max(lo, idx - h), min(hi, idx + h + 1)
+        if b > a:
+            idx = a + int(np.argmax(spec[a:b]))
+
     # flag if the chosen point is at (or right next to) either window edge
     at_boundary = (idx <= lo + 1) or (idx >= hi - 2)
 
-    # parabolic sub-bin peak offset from the three raw samples around idx
-    delta = 0.0
-    if 0 < idx < n - 1:
-        ym1, y0, yp1 = spec[idx - 1], spec[idx], spec[idx + 1]
-        denom = ym1 - 2.0 * y0 + yp1
-        if denom < 0.0:  # concave -> genuine local maximum
-            d = 0.5 * (ym1 - yp1) / denom
-            if -0.5 < d <= 0.5:
-                delta = float(d)
-    return idx, at_boundary, delta
+    return idx, at_boundary
+
+def check_gap_geometry(gap, width, tip_length, radius, resolution):
+    """
+    Validate the tip geometry BEFORE spending cluster hours on it.
+
+    Recomputes what build_geometry() will do - corrected_gap for the filleted
+    tip - and reports whether the result is still a physically meaningful,
+    resolvable gap. See the note at the top of this module for why sharp tips
+    degenerate.
+
+    Returns (corrected_gap_nm, flags): `flags` is a list of short strings,
+    empty when the geometry is sound.
+    """
+    px_nm = xm / float(resolution)
+    theta = 2.0 * np.arctan(width / (2.0 * tip_length))
+    delta = radius / np.sin(theta / 2.0) - radius
+    cg = gap - 2.0 * delta
+
+    flags = []
+    if cg <= 0:
+        flags.append(f"GAP_CLOSED(corrected={cg:.2f}nm)")
+    else:
+        if cg < MIN_CORRECTED_GAP_FRAC * gap:
+            flags.append(f"GAP_EATEN({cg:.2f}/{gap:.0f}nm="
+                         f"{100*cg/gap:.0f}%)")
+        if cg / px_nm < MIN_CORRECTED_GAP_PIXELS:
+            flags.append(f"GAP_UNDERRESOLVED({cg/px_nm:.1f}px)")
+    # radius == 0 is a deliberate sharp tip, not an unresolved fillet - only
+    # complain when a fillet was actually asked for and the grid cannot show it
+    if radius > 0 and radius / px_nm < MIN_RADIUS_PIXELS:
+        flags.append(f"FILLET_UNRESOLVED(R={radius/px_nm:.1f}px)")
+
+    if flags and mp.am_master():
+        print(f"[!] SUSPECT GEOMETRY gap={gap:.0f} W={width:.0f} "
+              f"L_tip={tip_length:.0f}: theta={np.degrees(theta):.1f} deg, "
+              f"corrected_gap={cg:.2f} nm ({cg/px_nm:.1f} px) -> {' '.join(flags)}")
+    return cg, flags
+
+
+def _gap_probe_sizes(gap, resolution):
+    """
+    Build the three gap DFT region sizes, all in Meep units.
+
+    Returns (full, inner, centre, info). `gap` is already in Meep units.
+
+    The inner box is a FIXED fraction of the gap (INNER_GAP_FRACTION) so that
+    FEF_mean measures the same physical volume at every resolution - see the
+    root-cause note at the top of this module. `info` carries the numbers that
+    must be written next to every result row, so a row can never again be
+    ambiguous about how it was measured.
+    """
+    px = 1.0 / float(resolution)
+    inner = INNER_GAP_FRACTION * gap
+    centre = CENTER_PROBE_PIXELS * px
+
+    full_size = mp.Vector3(gap, 10 / xm, 10 / xm)
+    inner_size = mp.Vector3(inner, 10 / xm, 10 / xm)
+    centre_size = mp.Vector3(centre, centre, centre)
+
+    n_px = inner / px
+    info = {"resolution": resolution, "inner_gap_nm": inner * xm,
+            "inner_px": n_px, "centre_px": CENTER_PROBE_PIXELS}
+    if n_px < MIN_INNER_PIXELS and mp.am_master():
+        print(f"[!] inner gap box spans only {n_px:.1f} pixels "
+              f"({inner*xm:.1f} nm at resolution {resolution}) - FEF_mean will "
+              f"be poorly sampled; raise the resolution rather than the box.")
+    return full_size, inner_size, centre_size, info
+
 
 def _dft_gap_spectra(sim, dft_box, dft_inner, dft_center, nfreq, comm, MPI):
     """
@@ -100,16 +267,21 @@ def _dft_gap_spectra(sim, dft_box, dft_inner, dft_center, nfreq, comm, MPI):
         max_amp[i]    - max |Ex| over the full gap box (includes pixels at
                         the metal walls -> grid-singular, resolution-dependent)
         mean_int[i]   - mean |Ex|^2 over the inner box (metal-adjacent pixels
-                        excluded -> converges with resolution)
-        center_amp[i] - |Ex| at the gap centre point
+                        excluded; fixed physical volume -> converges with
+                        resolution)
+        center_int[i] - mean |Ex|^2 over the small centre box
+
+    center is an INTENSITY now, not an amplitude: the probe went from one raw
+    Yee sample to a small box, so callers divide it directly by the empty
+    reference instead of squaring first.
 
     All reductions are MPI-safe whether get_dft_array returns full or
-    chunk-local arrays: max/center use MAX reduction, mean uses SUM of
+    chunk-local arrays: max uses a MAX reduction, the two means use SUM of
     (sum, count) so rank multiplicity cancels.
     """
     max_amp = np.zeros(nfreq)
     mean_int = np.zeros(nfreq)
-    center_amp = np.zeros(nfreq)
+    center_int = np.zeros(nfreq)
 
     for i in range(nfreq):
         arr = sim.get_dft_array(dft_box, mp.Ex, i)
@@ -238,8 +410,7 @@ def hybridbar_calculate_resonant_peaks():
     df = fmax - fmin
 
     center_wavelength_nm = (1.0 / fcen) * xm  # około 7338.7 nm
-    nfreq = 400
-
+    nfreq = 500
     config.resolution = 200
     config.lambda0 = center_wavelength_nm / xm
     config.frequency_width = 6.0 * df
@@ -301,7 +472,17 @@ def hybridbar_calculate_resonant_peaks():
         Th_Sub = 100 / xm
         L_Sub = (p["gap"] + 2 * p["L_bar"] + p["L_tip"] + 400)/xm
         W_Sub = (p["W"] + 400)/xm
-        radius = 5 / xm
+        # radius = 0 -> corected_gap == gap exactly and no apex patch is added,
+        # i.e. the simulated gap is the gap you asked for. At resolution 200 the
+        # 5 nm fillet is ONE pixel and buys no geometric fidelity, while its
+        # corrected_gap already costs 20% of the gap - so screening runs use a
+        # sharp tip and only the final showcase geometry is re-run rounded at
+        # high resolution. Sharp corners are grid-singular, which is exactly
+        # what FEF_mean (inner box, metal-adjacent pixels excluded) filters out.
+        radius = TIP_RADIUS_NM / xm
+
+        cg_nm, geom_flags = check_gap_geometry(
+            p["gap"], p["W"], p["L_tip"], TIP_RADIUS_NM, config.resolution)
 
         AuTop = HybridBar(gap=gap, bar_length=L_bar, tip_length=L_tip, width=width, thickness=Th_Au, radius=radius, material=Au, z_offset=0.0)
         TiBetween = HybridBar(gap=gap, bar_length=L_bar, tip_length=L_tip, width=width, thickness=Th_Ti, radius=radius, material=Ti, z_offset=-(Th_Au + Th_Ti)/2.0)
@@ -325,18 +506,16 @@ def hybridbar_calculate_resonant_peaks():
 
         comm, MPI = _get_mpi_comm()
 
-        # full gap box (touches the metal walls at x = +-gap/2)
-        dft_size = mp.Vector3(gap, 10/xm, 10/xm)
-        # inner box: exclude ~2 pixels next to each metal wall, where the
-        # discretized corner fields are singular and do not converge
-        inner_gap = max(gap - 4.0/config.resolution, 0.4*gap)
-        dft_size_inner = mp.Vector3(inner_gap, 10/xm, 10/xm)
+        # full box / inner box (fixed fraction of the gap, resolution-free) /
+        # small centre box - see the notes at the top of this module
+        dft_size, dft_size_inner, dft_size_c, probe = _gap_probe_sizes(
+            gap, config.resolution)
 
         sim_empty = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=[], sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
 
         dft_empty = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
         dft_empty_in = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
-        dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+        dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_c)
 
         # run until the DFT fields converge (pulse + ring-down), instead of
         # a fixed time shorter than the source itself
@@ -354,7 +533,7 @@ def hybridbar_calculate_resonant_peaks():
 
         dft_ant = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
         dft_ant_in = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
-        dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+        dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_c)
 
         sim.run(until_after_sources=mp.stop_when_dft_decayed(
             tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
@@ -370,23 +549,40 @@ def hybridbar_calculate_resonant_peaks():
             eps = 1e-16
             fef_max = ant_max**2 / (empty_max**2 + eps)          # hottest pixel (grid-singular)
             fef_mean = ant_mean / (empty_mean + eps)             # gap-averaged intensity
-            fef_center = ant_center**2 / (empty_center**2 + eps) # gap centre point
+            fef_center = ant_center / (empty_center + eps) # gap centre point
 
             # peak POSITION from the gap-centre spectrum: it tracks the
             # dipolar gap resonance cleanly, unlike the gap-averaged one
             # whose rising short-wavelength background pushes argmax to the
             # window edge. Interior local-max search avoids boundary pinning.
-            best_idx, at_boundary, delta = _pick_resonance_idx(fef_center, ref=empty_center)
-            # sub-bin interpolated peak: shift the winning bin by the parabolic
-            # offset so geometries closer than one DFT bin no longer collapse
-            # onto an identical reported wavelength
-            best_freq = freqs[best_idx] + delta * (freqs[1] - freqs[0])
+            best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=np.sqrt(empty_center))
+            best_freq = freqs[best_idx]
             best_wavelength_nm = (1.0 / best_freq) * xm
+
+            # heights at the SAME refined position, not at the nearest bin -
+            # bin-snapping under-reports exactly the sharpest (best) antennas
+            v_mean = float(fef_mean[best_idx])
+            v_center = float(fef_center[best_idx])
+            v_max = float(fef_max[best_idx])
+
+            flags = list(geom_flags)
+            if at_boundary:
+                flags.append("AT_WINDOW_EDGE")
+            # FEF_max is a max over a box CONTAINING the centre box, so this
+            # ordering cannot be violated by physics - only by a broken probe
+            if v_max < v_center:
+                flags.append(f"MAX<CENTER({v_max/v_center:.3f})")
+            smoothed = _median_filter(fef_center, PEAK_PICK_MEDIAN_BINS)
+            if smoothed[best_idx] > 0 and fef_center[best_idx] / smoothed[best_idx] > SPIKE_FLAG_RATIO:
+                flags.append("SPIKE")
+
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
-                  f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
-                  f"FEF_center = {fef_center[best_idx]:.2f}, "
-                  f"FEF_max_px = {fef_max[best_idx]:.2f}){warn}")
+                  f"(FEF_mean = {v_mean:.2f}, "
+                  f"FEF_center = {v_center:.2f}, "
+                  f"FEF_max_px = {v_max:.2f}){warn}")
+            if flags:
+                print(f"    [!] FLAGI: {' '.join(flags)}  <- wiersz podejrzany")
 
             import matplotlib.pyplot as plt
 
@@ -396,7 +592,7 @@ def hybridbar_calculate_resonant_peaks():
             plt.semilogy(wavelengths_nm, fef_mean, '-', color='darkred', linewidth=2, label='FEF mean (gap)')
             plt.semilogy(wavelengths_nm, fef_center, '-', color='darkblue', linewidth=1.5, label='FEF centre (peak pick)')
             plt.semilogy(wavelengths_nm, fef_max, '--', color='gray', linewidth=1.5, label='FEF max pixel')
-            plt.plot(best_wavelength_nm, fef_center[best_idx], 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
+            plt.plot(best_wavelength_nm, v_center, 'o', color='gold', markersize=8, markeredgecolor='black', label=f'Peak: {best_wavelength_nm:.1f} nm')
 
             plt.xlabel('Wavelength [nm]', fontsize=14)
             plt.ylabel('Field Enhancement Factor (FEF)', fontsize=14)
@@ -411,7 +607,15 @@ def hybridbar_calculate_resonant_peaks():
             print(f"Zapisano wykres widma: {plot_filename}")
 
             with open(results_filename, "a") as f:
-                f.write(f"{p['name']}\t{p['gap']}\t{p['L_bar']}\t{p['L_tip']}\t{p['W']}\t{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}\n")
+                # provenance columns: without them a row cannot be told apart
+                # from a row measured with a different radius / resolution /
+                # probe volume, which is exactly how summary1.txt went wrong.
+                # plot_resonance.parse_rows strips everything after '#'.
+                f.write(f"{p['name']}\t{p['gap']}\t{p['L_bar']}\t{p['L_tip']}\t{p['W']}\t"
+                        f"{best_wavelength_nm:.2f}\t{v_mean:.2f}\t{v_center:.2f}\t{v_max:.2f}"
+                        f"\t# res={config.resolution} R={TIP_RADIUS_NM:g}nm "
+                        f"corr_gap={cg_nm:.2f}nm inner={probe['inner_gap_nm']:.1f}nm"
+                        f"{(' FLAGS:' + ','.join(flags)) if flags else ''}\n")
 
     if mp.am_master():
         print_task(5, f" Wyniki zapisano w {results_filename}")
@@ -439,8 +643,7 @@ def splitbar_calculate_resonant_peaks():
     df = fmax - fmin
 
     center_wavelength_nm = (1.0 / fcen) * xm
-    nfreq = 400 
-
+    nfreq = 500
     config.resolution = 350   # lower to ~200-250 for screening
     config.lambda0 = center_wavelength_nm / xm
     config.frequency_width = 6.0 * df   # broad source; cancels in the ratio
@@ -504,15 +707,14 @@ def splitbar_calculate_resonant_peaks():
 
             comm, MPI = _get_mpi_comm()
 
-            dft_size = mp.Vector3(gap, 10/xm, 10/xm)
-            inner_gap = max(gap - 4.0/config.resolution, 0.4*gap)
-            dft_size_inner = mp.Vector3(inner_gap, 10/xm, 10/xm)
+            dft_size, dft_size_inner, dft_size_c, probe = _gap_probe_sizes(
+                gap, config.resolution)
 
             sim_empty = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=[], sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
 
             dft_empty = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
             dft_empty_in = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
-            dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+            dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_c)
 
             sim_empty.run(until_after_sources=mp.stop_when_dft_decayed(
                 tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
@@ -528,7 +730,7 @@ def splitbar_calculate_resonant_peaks():
 
             dft_ant = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
             dft_ant_in = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
-            dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+            dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_c)
 
             sim.run(until_after_sources=mp.stop_when_dft_decayed(
                 tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
@@ -544,11 +746,10 @@ def splitbar_calculate_resonant_peaks():
                 eps = 1e-16
                 fef_max = ant_max**2 / (empty_max**2 + eps)
                 fef_mean = ant_mean / (empty_mean + eps)
-                fef_center = ant_center**2 / (empty_center**2 + eps)
+                fef_center = ant_center / (empty_center + eps)
 
-                best_idx, at_boundary, delta = _pick_resonance_idx(fef_center, ref=empty_center)
-                # sub-bin interpolated peak (see note at the other call sites)
-                best_freq = freqs[best_idx] + delta * (freqs[1] - freqs[0])
+                best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=np.sqrt(empty_center))
+                best_freq = freqs[best_idx]
                 best_wavelength_nm = (1.0 / best_freq) * xm
                 warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
                 print(f"--> [{sub_name}] REZONANS: {best_wavelength_nm:.2f} nm "
@@ -795,9 +996,7 @@ def bowtie_calculate_resonant_peaks():
     df = fmax - fmin
 
     center_wavelength_nm = (1.0 / fcen) * xm  # około 7338.7 nm
-    nfreq = 400
-
-
+    nfreq = 500
     config.resolution = 200
     config.lambda0 = center_wavelength_nm / xm
     config.frequency_width = 6.0 * df
@@ -864,18 +1063,16 @@ def bowtie_calculate_resonant_peaks():
 
         comm, MPI = _get_mpi_comm()
 
-        # full gap box (touches the metal tips at x = +-gap/2)
-        dft_size = mp.Vector3(gap, 10/xm, 10/xm)
-        # inner box: exclude ~2 pixels next to each metal tip, where the
-        # discretized corner fields are singular and do not converge
-        inner_gap = max(gap - 4.0/config.resolution, 0.4*gap)
-        dft_size_inner = mp.Vector3(inner_gap, 10/xm, 10/xm)
+        # full box / inner box (fixed fraction of the gap, resolution-free) /
+        # small centre box - see the notes at the top of this module
+        dft_size, dft_size_inner, dft_size_c, probe = _gap_probe_sizes(
+            gap, config.resolution)
 
         sim_empty = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(config.pml)], geometry=[], sources=make_source(config), resolution=config.resolution, symmetries=config.symmetries, dimensions=3)
 
         dft_empty = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
         dft_empty_in = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
-        dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+        dft_empty_c = sim_empty.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_c)
 
         # run until the DFT fields converge (pulse + ring-down), instead of
         # a fixed time shorter than the source itself
@@ -893,7 +1090,7 @@ def bowtie_calculate_resonant_peaks():
 
         dft_ant = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size)
         dft_ant_in = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_inner)
-        dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=mp.Vector3())
+        dft_ant_c = sim.add_dft_fields([mp.Ex], fcen, df, nfreq, center=mp.Vector3(0, 0, 0), size=dft_size_c)
 
         sim.run(until_after_sources=mp.stop_when_dft_decayed(
             tol=DFT_DECAY_TOL, maximum_run_time=DFT_MAX_RUN_TIME))
@@ -909,17 +1106,14 @@ def bowtie_calculate_resonant_peaks():
             eps = 1e-16
             fef_max = ant_max**2 / (empty_max**2 + eps)          # hottest pixel (grid-singular)
             fef_mean = ant_mean / (empty_mean + eps)             # gap-averaged intensity
-            fef_center = ant_center**2 / (empty_center**2 + eps) # gap centre point
+            fef_center = ant_center / (empty_center + eps) # gap centre point
 
             # peak POSITION from the gap-centre spectrum: it tracks the
             # dipolar gap resonance cleanly, unlike the gap-averaged one
             # whose rising short-wavelength background pushes argmax to the
             # window edge. Interior local-max search avoids boundary pinning.
-            best_idx, at_boundary, delta = _pick_resonance_idx(fef_center, ref=empty_center)
-            # sub-bin interpolated peak: shift the winning bin by the parabolic
-            # offset so geometries closer than one DFT bin no longer collapse
-            # onto an identical reported wavelength
-            best_freq = freqs[best_idx] + delta * (freqs[1] - freqs[0])
+            best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=np.sqrt(empty_center))
+            best_freq = freqs[best_idx]
             best_wavelength_nm = (1.0 / best_freq) * xm
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
@@ -1134,19 +1328,17 @@ def bowtie_AuTiSiO2_opt():
 
 def postprocess_dft_efe():
     """
-    LOKALNY postprocessing wynikow z compute_dft_enhancement_maps (na Aresie
-    zapisywane sa tylko male pliki dft_enhancement_*.h5 + field_vs_time_gap.dat,
-    bez PNG). Ta funkcja renderuje mapy PNG i zapisuje srednie/maksymalne
+    Lokalny postprocessing wynikow z compute_dft_enhancement_maps. Renderuje mapy PNG i zapisuje srednie/maksymalne
     wzmocnienie w przerwie do pliku txt.
     """
     simulations = [
-        # {"folder": "HybridBar_gap_30nm_Lbar_1600nm_Ltip_150_W_240nm_AuTiSiO2_res350_lambda_9.57313", "gap": 30},
+        # {"folder": "HybridBar_gap_30nm_Lbar_2400nm_Ltip_200_W_240nm_AuTiSiO2_res300_lambda_8.47611", "gap": 30},
     ]
 
     Th_Au = 30.0  # nm
     Th_Ti = 5.0   # nm
 
-    results_filename = "results/DFT_EFE_summary.txt"
+    results_filename = "results/Hybrid/DFT_EFE_summary_2400x200x240.txt"
 
     if mp.am_master():
         with open(results_filename, "w") as f:
@@ -1232,7 +1424,6 @@ def postprocess_hybrid_efe():
         Th_Ti = 5 / xm
         Th_Sub = 100 / xm
         
-        # WZÓR MUSI BYĆ IDENTYCZNY JAK W SYMULACJI GŁÓWNEJ
         L_Sub = (gap_nm + 2 * L_bar_nm + L_tip_nm + 400) / xm
         W_Sub = (width_nm + 400) / xm
         radius = 5 / xm
@@ -1259,7 +1450,6 @@ def postprocess_hybrid_efe():
             radius=radius
         )
         
-        # PARAMETRY SIATKI MUSZĄ BYĆ IDENTYCZNE (było 100, zmienione na poprawne z aresa)
         config.pad = 200 / xm
         config.pml = 500 / xm
         
@@ -1270,8 +1460,7 @@ def postprocess_hybrid_efe():
         ]
         
         cell = make_cell(config=config)
-        
-        # Zmieniono VolumeSet na VolumeSetROI, by pasowało do klasy
+
         antenna_vols = VolumeSetROI(cell, antenna=AuTop)
         
         roi_w = gap_nm

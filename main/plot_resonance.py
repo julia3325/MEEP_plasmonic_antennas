@@ -229,7 +229,6 @@ def summarize(data, kind="hybrid"):
 if __name__ == "__main__":
 
     Hybrid_FEFvsW = """
-    HybridBar_3  30  1600  150  160  6075.26  32172.28  32728.94  44491.69
     HybridBar_3  30  1600  150  200  6076.71  29166.10  29675.69  40199.56
     HybridBar_4  30  1600  150  240  6082.20  17896.85  19136.39  27764.71
     HybridBar_4  30	 1600  150	280	 6126.21  16434.88	17574.56  25465.27
@@ -248,8 +247,6 @@ if __name__ == "__main__":
     HybridBar_3	 30	 1600  50  240  6089.70  9805.60  9950.34  15770.22
     HybridBar_3  30  1600  100  240  6063.44  17332.22  18481.73  26139.68
     HybridBar_3	 30	 1600  200	240	 6141.02  18646.39	19936.33  29141.29
-    HybridBar_3	 30	 1600  250	240	 6253.80  35667.73	88897.58  86427.98
-    HybridBar_3	 30	 1600  300	240	 6327.40  37014.86	92472.25  87130.65
     """
     Hybrid_FEFvsgap = """
     HybridBar_4  30  1600  150  240  6082.20  17896.85  19136.39  27764.71
@@ -266,6 +263,39 @@ if __name__ == "__main__":
     HybridBar  30  2200  150  240  7849.04  30147.20  32234.07  46796.24
     HybridBar  30  2400  150  240  8421.60  34876.60  37290.54  54151.44
     """
+
+    Bowtie_FEFvsL = """
+    BowTie4 30      500     300     5712.79 88.45   0.03    2905.58
+    BowTie4 30      150     300     10258.50        42.65   45.62   64.14
+    BowTie4 30      300     300     5712.79 263.87  268.44  367.03
+    BowTie4 30      700     300     8229.84 1064.25 1096.91 2474.55
+    BowTie4 30      900     300     10142.41        2796.49 2881.60 6614.31
+
+    """
+
+    Bowtie_FEFvsW = """
+    BowTie4 30      500     300     5712.79 88.45   0.03    2905.58
+    BowTie4 30      500     200     6320.01 325.60  335.56  759.72
+    BowTie4 30      500     400     6149.30 1449.81 3609.05 3555.78
+    BowTie4 30      500     500     6057.35 1199.07 1219.79 1674.72
+    BowTie4 30      500     700     5712.79 788.01  842.51  1242.75
+    """
+
+    Bowtie_FEFvsgap = """
+    BowTie4 30      500     300     5712.79 88.45   0.03    2905.58
+    BowTie4 50      500     300     6360.56 514.72  961.60  1438.55
+    BowTie4 70      500     300     6498.57 229.05  201.36  741.41
+    BowTie4 90      500     300     6622.75 141.92  75.64   580.69
+    """
+
+    plot_fef_vs(Bowtie_FEFvsW, xvar="W", kind="bowtie", fef="mean",
+                note="fixed: L = 500, gap=30 nm")
+
+    plot_fef_vs(Bowtie_FEFvsL, xvar="L", kind="bowtie", fef="mean",
+                note="fixed: W = 300, gap=30 nm")
+
+    plot_fef_vs(Bowtie_FEFvsgap, xvar="gap", kind="bowtie", fef="mean",
+                note="fixed: L=500, W = 300 nm")
     
     # plot_fef_vs(Hybrid_FEFvsW, xvar="W", kind="hybrid", fef="mean",
     #             note="fixed: L_bar=1600, L_tip=150, gap=30 nm")
@@ -279,8 +309,8 @@ if __name__ == "__main__":
     # plot_fef_vs(Hybrid_FEFvsgap, xvar="gap", kind="hybrid", fef="mean",
     #             note="fixed: L_bar=1600, L_tip=150, W = 240")
 
-    plot_fef_vs(Hybrid_FEFvslambda, xvar="lambda", kind="hybrid", fef="mean",
-                note="L_tip=150, W=240, gap=30 nm")
+    # plot_fef_vs(Hybrid_FEFvslambda, xvar="lambda", kind="hybrid", fef="mean",
+    #             note="L_tip=150, W=240, gap=30 nm")
 
     # ----------------whole file + inline filter -------------------------
     # plot_fef_vs("results/Hybrid/resonant_peaks_hybrid_summary1.txt",

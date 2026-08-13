@@ -44,6 +44,9 @@ def run():
                                                    with_substrate=True, view_nm=None,
                                                    out_dir="results/geom_check")
     
+    elif mode == 7:
+        postprocess_dft_efe()
+        
     else:
         print("Invalid mode. Please choose a mode between 1 and 2.")
 

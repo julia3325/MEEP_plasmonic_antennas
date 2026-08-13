@@ -228,3 +228,24 @@ priv/
 
 # Other
 *.sh
+
+# ============================================================
+# Notatki i artefakty robocze (dopisane 2026-08)
+# ============================================================
+
+# WSL/Windows: znaczniki pochodzenia pliku, tworzone przy kopiowaniu z sieci
+*:Zone.Identifier
+
+# Notatki miedzy sesjami - lokalne, nie naleza do historii repo
+HANDOFF*.md
+
+# Dokumenty
+*.pdf
+
+# Wykresy generowane lokalnie (PNG lapie sie juz na *.png, ale katalog
+# trzymamy pusty w historii)
+plots/
+
+# Dane tekstowe z symulacji poza results/ (podsumowania, monitory czasowe)
+*_summary*.txt
+field_vs_time*.dat
