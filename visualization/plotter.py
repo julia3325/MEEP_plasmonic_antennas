@@ -1145,6 +1145,18 @@ def save_2D_plot(sim, volume, save_name="2Dplot.png", IMG_SAVE=True, path_to_sav
         sim.plot2D(output_plane=volume,
                 eps_parameters={'alpha':0.8, 'cmap':'binary', 'interpolation':'spline36', 'frequency':1/0.2},
                 boundary_parameters={'hatch':'o', 'linewidth':1.5, 'facecolor':'y', 'edgecolor':'b', 'alpha':0.3})
+        # sim.plot2D() labels the axes "X"/"Y"/"Z" with no unit. Meep lengths
+        # are in units of a = 1 um (xm = 1000 in the experiment modules), so the
+        # numbers already ARE micrometres - only the label was missing. Derive
+        # the pair from the plane name in save_name; fall back to leaving the
+        # Meep labels alone when the name says nothing.
+        ax = plt.gca()
+        plane = next((p for p in ("XY", "XZ", "YZ", "XY", "YX")
+                      if save_name and p in save_name), None)
+        if plane:
+            ax.set_xlabel(rf"{plane[0]} [$\mu$m]")
+            ax.set_ylabel(rf"{plane[1]} [$\mu$m]")
+
         if config is not None:
             if save_name is not None and any(axis in save_name for axis in ("XZ", "YZ")):
                 plt.hlines(config.z_reflection, -config.cell_size[0]/2.0, config.cell_size[0]/2.0, color='blue', linestyle='--', linewidth=1.0)

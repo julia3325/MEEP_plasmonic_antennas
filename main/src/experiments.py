@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, time
 import meep as mp
 from meep.materials import *
 from utils.sys_utils import *
@@ -97,6 +97,37 @@ def _get_mpi_comm():
     except ImportError:
         return None, None
 
+def _init_results_file(path, header):
+    """
+    Prepare a summary file WITHOUT ever truncating it. Call on the master rank.
+    Returns the path actually used - assign it back to `results_filename`.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w") as f:
+            f.write(header)
+        return path
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        existing = f.readline()
+
+    if existing.strip() == header.strip():
+        print(f"[i] dopisuje do istniejacego {path}")
+        return path
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    root, ext = os.path.splitext(path)
+    new_path = f"{root}_{stamp}{ext or '.txt'}"
+    print(f"[!] {path} ma inny naglowek (zmienil sie format kolumn) - "
+          f"nie ruszam go, pisze do {new_path}")
+    with open(new_path, "w") as f:
+        f.write(header)
+    return new_path
+
+
 def _median_filter(y, width):
     """
     Odd-width running median with edge padding. numpy only - scipy is not
@@ -192,22 +223,38 @@ def _pick_resonance_idx(spectrum, ref=None, edge_guard=2, snr_frac=0.1,
 
     return idx, at_boundary
 
-def check_gap_geometry(gap, width, tip_length, radius, resolution):
+def check_gap_geometry(gap, width=None, tip_length=None, radius=0.0,
+                       resolution=200):
     """
-    Validate the tip geometry BEFORE spending cluster hours on it.
+    Validate the gap geometry BEFORE spending cluster hours on it.
 
-    Recomputes what build_geometry() will do - corrected_gap for the filleted
-    tip - and reports whether the result is still a physically meaningful,
-    resolvable gap. See the note at the top of this module for why sharp tips
-    degenerate.
+    Recomputes what build_geometry() will do and reports whether the result is
+    still a physically meaningful, resolvable gap. See the note at the top of
+    this module for why sharp tips degenerate.
 
-    Returns (corrected_gap_nm, flags): `flags` is a list of short strings,
+    All lengths in nm.
+
+    width / tip_length : the tapered tip, i.e. HybridBar(W, L_tip) or
+        BowTie(W, L). Omit them for SplitBar, which is two plain bars with no
+        tip and therefore no fillet correction - its gap is used verbatim and
+        only the resolution check applies.
+
+    Returns (effective_gap_nm, flags): `flags` is a list of short strings,
     empty when the geometry is sound.
     """
     px_nm = xm / float(resolution)
-    theta = 2.0 * np.arctan(width / (2.0 * tip_length))
-    delta = radius / np.sin(theta / 2.0) - radius
-    cg = gap - 2.0 * delta
+
+    # A tapered tip (HybridBar, BowTie) shrinks the gap through the fillet
+    # correction; SplitBar is two plain bars with no tip, so its gap is used
+    # verbatim by build_geometry() and only needs the resolution check.
+    if tip_length and width and radius > 0:
+        theta = 2.0 * np.arctan(width / (2.0 * tip_length))
+        cg = gap - 2.0 * (radius / np.sin(theta / 2.0) - radius)
+        shape = (f"W={width:.0f} L_tip={tip_length:.0f}, "
+                 f"theta={np.degrees(theta):.1f} deg, ")
+    else:
+        cg = gap
+        shape = ""
 
     flags = []
     if cg <= 0:
@@ -224,10 +271,62 @@ def check_gap_geometry(gap, width, tip_length, radius, resolution):
         flags.append(f"FILLET_UNRESOLVED(R={radius/px_nm:.1f}px)")
 
     if flags and mp.am_master():
-        print(f"[!] SUSPECT GEOMETRY gap={gap:.0f} W={width:.0f} "
-              f"L_tip={tip_length:.0f}: theta={np.degrees(theta):.1f} deg, "
-              f"corrected_gap={cg:.2f} nm ({cg/px_nm:.1f} px) -> {' '.join(flags)}")
+        print(f"[!] SUSPECT GEOMETRY gap={gap:.0f}: {shape}"
+              f"effective_gap={cg:.2f} nm ({cg/px_nm:.1f} px) -> {' '.join(flags)}")
     return cg, flags
+
+
+def _result_flags(fef_mean, fef_center, fef_max, best_idx, at_boundary,
+                  geom_flags=()):
+    """
+    Self-consistency flags for one reported row.
+
+    WHY: summary1.txt had four rows that looked like ordinary numbers and were
+    plotted as physics for weeks. Nothing in the output said they were broken -
+    it took comparing ratios across the whole file to notice. These checks make
+    a bad row announce itself at the moment it is produced:
+
+      MAX<CENTER    FEF_max_px is a maximum over a box that CONTAINS the centre
+                    box, and both are divided by an almost identical empty-run
+                    value, so max >= centre cannot be violated by physics. When
+                    it is, a probe is reading somewhere it should not - e.g.
+                    inside the metal, which is what the degenerate geometries did.
+      AT_WINDOW_EDGE  the peak sits at the edge of the search window, so the
+                    true resonance is probably outside it and the reported FEF
+                    is an off-resonance value (all three bow-tie rows at
+                    5712.79 nm were this).
+      SPIKE         the winning bin stands far above the median-filtered
+                    spectrum, i.e. a single-bin artefact rather than a resonance.
+
+    Plus whatever check_gap_geometry already found about the geometry itself.
+    """
+    flags = list(geom_flags)
+    if at_boundary:
+        flags.append("AT_WINDOW_EDGE")
+    if fef_max[best_idx] < fef_center[best_idx]:
+        flags.append(f"MAX<CENTER({fef_max[best_idx]/fef_center[best_idx]:.3f})")
+    smoothed = _median_filter(fef_center, PEAK_PICK_MEDIAN_BINS)
+    if smoothed[best_idx] > 0 and fef_center[best_idx] / smoothed[best_idx] > SPIKE_FLAG_RATIO:
+        flags.append("SPIKE")
+    return flags
+
+
+def _provenance(resolution, radius_nm, cg_nm, probe, flags):
+    """
+    Trailing '#' comment written next to every result row.
+
+    WHY: a row records geometry and FEF but says nothing about HOW it was
+    measured. Rows produced at different radius / probe volume are then
+    indistinguishable, which is exactly how the summary1.txt confusion started
+    - the only clue was a hand-typed `HybridBar_1` vs `_3` label that turned out
+    to mean nothing. plot_resonance.parse_rows() cuts everything after '#', so
+    this is invisible to the plots.
+    """
+    txt = (f"\t# res={resolution} R={radius_nm:g}nm "
+           f"eff_gap={cg_nm:.2f}nm inner={probe['inner_gap_nm']:.1f}nm")
+    if flags:
+        txt += " FLAGS:" + ",".join(flags)
+    return txt
 
 
 def _gap_probe_sizes(gap, resolution):
@@ -449,12 +548,10 @@ def hybridbar_calculate_resonant_peaks():
     ]
 
     results_filename = "results/resonant_peaks_hybrid_summary6.txt"
-    if not os.path.exists("results") and mp.am_master():
-        os.makedirs("results")
-        
     if mp.am_master():
-        with open(results_filename, "w") as f:
-            f.write("Geometria\tGap[nm]\tL_bar[nm]\tL_tip[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
+        results_filename = _init_results_file(
+            results_filename,
+            "Geometria\tGap[nm]\tL_bar[nm]\tL_tip[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
 
     freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
 
@@ -565,16 +662,8 @@ def hybridbar_calculate_resonant_peaks():
             v_center = float(fef_center[best_idx])
             v_max = float(fef_max[best_idx])
 
-            flags = list(geom_flags)
-            if at_boundary:
-                flags.append("AT_WINDOW_EDGE")
-            # FEF_max is a max over a box CONTAINING the centre box, so this
-            # ordering cannot be violated by physics - only by a broken probe
-            if v_max < v_center:
-                flags.append(f"MAX<CENTER({v_max/v_center:.3f})")
-            smoothed = _median_filter(fef_center, PEAK_PICK_MEDIAN_BINS)
-            if smoothed[best_idx] > 0 and fef_center[best_idx] / smoothed[best_idx] > SPIKE_FLAG_RATIO:
-                flags.append("SPIKE")
+            flags = _result_flags(fef_mean, fef_center, fef_max,
+                                  best_idx, at_boundary, geom_flags)
 
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
@@ -613,9 +702,8 @@ def hybridbar_calculate_resonant_peaks():
                 # plot_resonance.parse_rows strips everything after '#'.
                 f.write(f"{p['name']}\t{p['gap']}\t{p['L_bar']}\t{p['L_tip']}\t{p['W']}\t"
                         f"{best_wavelength_nm:.2f}\t{v_mean:.2f}\t{v_center:.2f}\t{v_max:.2f}"
-                        f"\t# res={config.resolution} R={TIP_RADIUS_NM:g}nm "
-                        f"corr_gap={cg_nm:.2f}nm inner={probe['inner_gap_nm']:.1f}nm"
-                        f"{(' FLAGS:' + ','.join(flags)) if flags else ''}\n")
+                        + _provenance(config.resolution, TIP_RADIUS_NM,
+                                      cg_nm, probe, flags) + "\n")
 
     if mp.am_master():
         print_task(5, f" Wyniki zapisano w {results_filename}")
@@ -660,12 +748,10 @@ def splitbar_calculate_resonant_peaks():
     ]
 
     results_filename = "results/resonant_peaks_splitbar_summary.txt"
-    if not os.path.exists("results") and mp.am_master():
-        os.makedirs("results")
-
     if mp.am_master():
-        with open(results_filename, "w") as f:
-            f.write("Geometria\tSubstrate\tGap[nm]\tL[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
+        results_filename = _init_results_file(
+            results_filename,
+            "Geometria\tSubstrate\tGap[nm]\tL[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
 
     freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
 
@@ -683,7 +769,14 @@ def splitbar_calculate_resonant_peaks():
             Th_Sub = 100 / xm
             L_Sub = (p["gap"] + 2 * p["L"] + 400) / xm   # 2*L + gap + margin
             W_Sub = (p["W"] + 400) / xm
+            # SplitBar has no tapered tip, so there is no fillet gap
+            # correction here - the radius only rounds the bar corners and the
+            # gap is used verbatim. check_gap_geometry is called without
+            # width/tip_length, so it only verifies that the gap is resolved.
             radius = 5 / xm
+
+            cg_nm, geom_flags = check_gap_geometry(
+                p["gap"], resolution=config.resolution)
 
             AuTop = SplitBar(gap=gap, length=L_arm, width=width, thickness=Th_Au, radius=radius, material=Au, z_offset=0.0)
             TiBetween = SplitBar(gap=gap, length=L_arm, width=width, thickness=Th_Ti, radius=radius, material=Ti, z_offset=-(Th_Au + Th_Ti)/2.0)
@@ -751,11 +844,15 @@ def splitbar_calculate_resonant_peaks():
                 best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=np.sqrt(empty_center))
                 best_freq = freqs[best_idx]
                 best_wavelength_nm = (1.0 / best_freq) * xm
+                flags = _result_flags(fef_mean, fef_center, fef_max,
+                                      best_idx, at_boundary, geom_flags)
                 warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
                 print(f"--> [{sub_name}] REZONANS: {best_wavelength_nm:.2f} nm "
                       f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
                       f"FEF_center = {fef_center[best_idx]:.2f}, "
                       f"FEF_max_px = {fef_max[best_idx]:.2f}){warn}")
+                if flags:
+                    print(f"    [!] FLAGI: {' '.join(flags)}  <- wiersz podejrzany")
 
                 import matplotlib.pyplot as plt
 
@@ -780,7 +877,10 @@ def splitbar_calculate_resonant_peaks():
                 print(f"Zapisano wykres widma: {plot_filename}")
 
                 with open(results_filename, "a") as f:
-                    f.write(f"{p['name']}\t{sub_name}\t{p['gap']}\t{p['L']}\t{p['W']}\t{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}\n")
+                    f.write(f"{p['name']}\t{sub_name}\t{p['gap']}\t{p['L']}\t{p['W']}\t"
+                            f"{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t"
+                            f"{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}"
+                            + _provenance(config.resolution, 5.0, cg_nm, probe, flags) + "\n")
 
     if mp.am_master():
         print_task(5, f" Wyniki zapisano w {results_filename}")
@@ -1020,12 +1120,10 @@ def bowtie_calculate_resonant_peaks():
     ]
 
     results_filename = "results/resonant_peaks_bowtie_summary2.txt"
-    if not os.path.exists("results") and mp.am_master():
-        os.makedirs("results")
-        
     if mp.am_master():
-        with open(results_filename, "w") as f:
-            f.write("Geometria\tGap[nm]\tL[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
+        results_filename = _init_results_file(
+            results_filename,
+            "Geometria\tGap[nm]\tL[nm]\tW[nm]\tResonant_Wavelength[nm]\tFEF_mean_gap\tFEF_center\tFEF_max_px\n")
 
     freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
 
@@ -1041,7 +1139,14 @@ def bowtie_calculate_resonant_peaks():
         Th_Sub = 100 / xm
         L_Sub = (params["gap"] + 2 * params["L"] + 400)/xm
         W_Sub = (params["W"] + 400)/xm
-        radius = 5 / xm
+        # see TIP_RADIUS_NM at the top of this module: bow-tie tips are much
+        # sharper than the hybrid ones, so the fillet correction degenerates
+        # even faster here (L=900/W=300 gives corrected_gap = -20.8 nm)
+        radius = TIP_RADIUS_NM / xm
+
+        cg_nm, geom_flags = check_gap_geometry(
+            params["gap"], params["W"], params["L"], TIP_RADIUS_NM,
+            config.resolution)
 
         AuTop = BowTie(gap=gap, length=L_tri, width=width, thickness=Th_Au, radius=radius, material=Au, z_offset=0.0)
         TiBetween = BowTie(gap=gap, length=L_tri, width=width, thickness=Th_Ti, radius=radius, material=Ti, z_offset=-(Th_Au + Th_Ti)/2.0)
@@ -1115,11 +1220,15 @@ def bowtie_calculate_resonant_peaks():
             best_idx, at_boundary = _pick_resonance_idx(fef_center, ref=np.sqrt(empty_center))
             best_freq = freqs[best_idx]
             best_wavelength_nm = (1.0 / best_freq) * xm
+            flags = _result_flags(fef_mean, fef_center, fef_max,
+                                  best_idx, at_boundary, geom_flags)
             warn = "  [!] brak piku w oknie - rezonans prawdopodobnie POZA zakresem" if at_boundary else ""
             print(f"--> ZNALEZIONO REZONANS: {best_wavelength_nm:.2f} nm "
                   f"(FEF_mean = {fef_mean[best_idx]:.2f}, "
                   f"FEF_center = {fef_center[best_idx]:.2f}, "
                   f"FEF_max_px = {fef_max[best_idx]:.2f}){warn}")
+            if flags:
+                print(f"    [!] FLAGI: {' '.join(flags)}  <- wiersz podejrzany")
 
             import matplotlib.pyplot as plt
 
@@ -1144,7 +1253,11 @@ def bowtie_calculate_resonant_peaks():
             print(f"Zapisano wykres widma: {plot_filename}")
 
             with open(results_filename, "a") as f:
-                f.write(f"{params['name']}\t{params['gap']}\t{params['L']}\t{params['W']}\t{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}\n")
+                f.write(f"{params['name']}\t{params['gap']}\t{params['L']}\t{params['W']}\t"
+                        f"{best_wavelength_nm:.2f}\t{fef_mean[best_idx]:.2f}\t"
+                        f"{fef_center[best_idx]:.2f}\t{fef_max[best_idx]:.2f}"
+                        + _provenance(config.resolution, TIP_RADIUS_NM,
+                                      cg_nm, probe, flags) + "\n")
 
     if mp.am_master():
         print_task(5, f" Wyniki zapisano w {results_filename}")
@@ -1341,12 +1454,13 @@ def postprocess_dft_efe():
     results_filename = "results/Hybrid/DFT_EFE_summary_2400x200x240.txt"
 
     if mp.am_master():
-        with open(results_filename, "w") as f:
-            f.write("Folder\tGap[nm]\t"
-                    "meanROI_XY\tmaxROI_XY\tmax_XY\t"
-                    "meanROI_XYTOP\tmaxROI_XYTOP\tmax_XYTOP\t"
-                    "meanROI_XZ\tmaxROI_XZ\tmax_XZ\t"
-                    "meanROI_YZ\tmaxROI_YZ\tmax_YZ\n")
+        results_filename = _init_results_file(
+            results_filename,
+            "Folder\tGap[nm]\t"
+                "meanROI_XY\tmaxROI_XY\tmax_XY\t"
+                "meanROI_XYTOP\tmaxROI_XYTOP\tmax_XYTOP\t"
+                "meanROI_XZ\tmaxROI_XZ\tmax_XZ\t"
+                "meanROI_YZ\tmaxROI_YZ\tmax_YZ\n")
 
     for sim in simulations:
         folder = sim["folder"]
@@ -1396,8 +1510,9 @@ def postprocess_hybrid_efe():
     results_filename = "results/EFE_summary_hybrid.txt"
     
     if mp.am_master():
-        with open(results_filename, "w") as f:
-            f.write("Folder\tGap[nm]\tL_bar[nm]\tL_tip[nm]\tW[nm]\tEFE_XY\tEFE_XZ\tEFE_YZ\n")
+        results_filename = _init_results_file(
+            results_filename,
+            "Folder\tGap[nm]\tL_bar[nm]\tL_tip[nm]\tW[nm]\tEFE_XY\tEFE_XZ\tEFE_YZ\n")
 
     for sim in simulations:
         folder = sim["folder"]
@@ -1505,8 +1620,9 @@ def postprocess_bowties_efe():
     results_filename = "results/EFE_summary.txt"
     
     if mp.am_master():
-        with open(results_filename, "w") as f:
-            f.write("Folder\tGap[nm]\tL[nm]\tW[nm]\tEFE_XY\tEFE_XZ\tEFE_YZ\n")
+        results_filename = _init_results_file(
+            results_filename,
+            "Folder\tGap[nm]\tL[nm]\tW[nm]\tEFE_XY\tEFE_XZ\tEFE_YZ\n")
 
     for sim in simulations:
         folder = sim["folder"]
