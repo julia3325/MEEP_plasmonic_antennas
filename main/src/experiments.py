@@ -394,19 +394,24 @@ def _dft_gap_spectra(sim, dft_box, dft_inner, dft_center, nfreq, comm, MPI):
             s, n = 0.0, 0.0
 
         arr_c = sim.get_dft_array(dft_center, mp.Ex, i)
-        vc = float(np.max(np.abs(arr_c))) if (arr_c is not None and arr_c.size > 0) else 0.0
+        if arr_c is not None and arr_c.size > 0:
+            sc = float(np.sum(np.abs(arr_c) ** 2))
+            nc = float(arr_c.size)
+        else:
+            sc, nc = 0.0, 0.0
 
         if comm is not None:
             vmax = comm.allreduce(vmax, op=MPI.MAX)
             s = comm.allreduce(s, op=MPI.SUM)
             n = comm.allreduce(n, op=MPI.SUM)
-            vc = comm.allreduce(vc, op=MPI.MAX)
+            sc = comm.allreduce(sc, op=MPI.SUM)
+            nc = comm.allreduce(nc, op=MPI.SUM)
 
         max_amp[i] = vmax
         mean_int[i] = s / n if n > 0 else 0.0
-        center_amp[i] = vc
+        center_int[i] = sc / nc if nc > 0 else 0.0
 
-    return max_amp, mean_int, center_amp
+    return max_amp, mean_int, center_int
 
 def check_antenna_geometry(kind="hybridbar", gap=30, W=240, L_bar=1800, L_tip=150,
                            length=1100, radius=5, resolution=800,
