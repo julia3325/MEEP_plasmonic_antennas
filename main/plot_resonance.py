@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plot_resonance.py  --  FEF-trend plots for hybridbar & bowtie resonance scans
+plot_resonance.py  --  FEF-trend plots for hybridbar, bowtie & splitbar scans
 =============================================================================
 
 
@@ -26,11 +26,23 @@ Two ways to feed data (you never have to split the summary into several files):
 Column layout is known from `kind`, so pasted rows may include or omit the
 header line; comments after '#' and rows whose numbers are corrupted are skipped.
 
-  kind="hybrid":  Geometria  gap  L_bar  L_tip  W  lambda  FEF_mean  FEF_center  FEF_max
-  kind="bowtie":  Geometria  gap  L      W      lambda  FEF_mean  FEF_center  FEF_max
+  kind="hybrid":    Geometria  gap  L_bar  L_tip  W  lambda  FEF_mean  FEF_center  FEF_max
+  kind="bowtie":    Geometria  gap  L      W      lambda  FEF_mean  FEF_center  FEF_max
+  kind="splitbar":  Geometria [Substrate] gap  L  W  lambda  FEF_mean  FEF_center  FEF_max
+
+splitbar shares the bow-tie column layout; an optional Substrate label (SiO2 /
+Si) written right after the geometry name by splitbar_calculate_resonant_peaks
+is detected and skipped automatically.
 """
 
 import os
+import matplotlib
+# Force a non-interactive backend unless one is explicitly chosen: on WSL the Qt
+# backend aborts with "could not load plugin xcb" (no X server), which crashes
+# every plot. Honour an existing MPLBACKEND so a machine with a display can
+# still override. Same reasoning as postprocess_maps.py.
+if "MPLBACKEND" not in os.environ:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator, MultipleLocator
 
@@ -53,7 +65,7 @@ XINFO = {
 FEF_YLABEL = {"mean": "Mean FEF in the gap region",
               "center": "FEF at the gap centre",
               "max": "Max-pixel FEF in the gap"}
-KIND_LABEL = {"hybrid": "HybridBar", "bowtie": "BowTie"}
+KIND_LABEL = {"hybrid": "HybridBar", "bowtie": "BowTie", "splitbar": "SplitBar"}
 
 
 # ======================================================================
@@ -75,8 +87,8 @@ def parse_rows(data, kind):
     Positional by `kind`; a header line, comments and rows with
     non-numeric cells are skipped automatically.
     """
-    if kind not in ("hybrid", "bowtie"):
-        raise ValueError("kind must be 'hybrid' or 'bowtie'")
+    if kind not in ("hybrid", "bowtie", "splitbar"):
+        raise ValueError("kind must be 'hybrid', 'bowtie' or 'splitbar'")
     n_num = 8 if kind == "hybrid" else 7
 
     rows = []
@@ -88,6 +100,14 @@ def parse_rows(data, kind):
         if len(toks) < 5 or toks[0].lower() == "geometria":
             continue
         nums = toks[1:]
+        # splitbar summaries may carry a Substrate label (e.g. SiO2 / Si) right
+        # after the geometry name; drop a leading non-numeric token so the
+        # numeric layout matches bow-tie (gap L W lambda FEF_mean center max).
+        if kind == "splitbar" and nums:
+            try:
+                float(nums[0])
+            except ValueError:
+                nums = nums[1:]
         try:
             vals = [float(t) for t in nums[:max(n_num, len(nums))]]
         except ValueError:
@@ -104,7 +124,7 @@ def parse_rows(data, kind):
                        lam=vals[4], fef_mean=vals[5],
                        fef_center=vals[6] if len(vals) > 6 else vals[5],
                        fef_max=vals[7] if len(vals) > 7 else vals[5])
-        else:  # bowtie
+        else:  # bowtie / splitbar (same gap L W lambda FEF... layout)
             if len(vals) < 5:              # need gap,L,W,lambda,+1 FEF
                 continue
             rec = dict(gap=vals[0], l=vals[1], w=vals[2], lam=vals[3],
@@ -130,8 +150,8 @@ def plot_fef_vs(data, xvar, kind="hybrid", fef="mean", fixed=None,
     Make figure of FEF versus `xvar`.
 
     data      : pasted rows (string) OR path to a summary .txt
-    xvar      : "L_bar" | "L_tip" | "W" | "gap" | "lambda"   (bowtie: "L"|"W"|"gap"|"lambda")
-    kind      : "hybrid" | "bowtie"
+    xvar      : "L_bar" | "L_tip" | "W" | "gap" | "lambda"   (bowtie/splitbar: "L"|"W"|"gap"|"lambda")
+    kind      : "hybrid" | "bowtie" | "splitbar"
     fef       : "mean" (default) | "center" | "max"
     fixed     : optional {"L_bar":1600, ...} to keep params fixed when you pass
                 a whole file instead of pasting a subset
@@ -287,6 +307,25 @@ if __name__ == "__main__":
     BowTie4 70      500     300     6498.57 229.05  201.36  741.41
     BowTie4 90      500     300     6622.75 141.92  75.64   580.69
     """
+
+    # splitbar: same 7-column layout as bow-tie (gap L W lambda FEF...).
+    # Rows may include a Substrate label right after the name - it is skipped.
+    Splitbar_FEFvsL = """
+    SplitBar_res200  30  1750  200  6744.24  10272.73  13201.18  14787.03
+    SplitBar_res200  30  2150  200  8027.92  14838.62  19236.06  21161.62
+    SplitBar_res200  30  2550  200  9252.53  20282.27  26292.05  28961.71
+    """
+    Splitbar_FEFvsW = """
+    SplitBar_res200  30  2550  200  9252.53  20282.27  26292.05  28961.71
+    SplitBar_res200  30  2550  240  9347.59  18369.47  23813.40  26239.78
+    SplitBar_res200  30  2550  280  9444.63  16694.29  21642.25  23855.96
+    """
+
+    plot_fef_vs(Splitbar_FEFvsL, xvar="L", kind="splitbar", fef="mean",
+                note="fixed: W = 200, gap=30 nm")
+
+    plot_fef_vs(Splitbar_FEFvsW, xvar="W", kind="splitbar", fef="mean",
+                note="fixed: L = 2550, gap=30 nm")
 
     plot_fef_vs(Bowtie_FEFvsW, xvar="W", kind="bowtie", fef="mean",
                 note="fixed: L = 500, gap=30 nm")

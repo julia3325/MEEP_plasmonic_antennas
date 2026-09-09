@@ -46,9 +46,12 @@ def run():
     
     elif mode == 7:
         postprocess_dft_efe()
-        
+
+    elif mode == 8:
+        splitbar_AuTiSiO2_opt()
+
     else:
-        print("Invalid mode. Please choose a mode between 1 and 2.")
+        print("Invalid mode. Please choose a mode between 1 and 8.")
 
 if __name__ == "__main__":
     run()

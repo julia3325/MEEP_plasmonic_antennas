@@ -672,12 +672,12 @@ def hybridbar_calculate_resonant_peaks():
 
             plt.xlabel('Wavelength [nm]', fontsize=14)
             plt.ylabel('Field Enhancement Factor (FEF)', fontsize=14)
-            plt.title(f'Resonance Spectrum: L_bar {p["L_bar"]} nm, L_tip {p["L_tip"]} nm, width {p["W"]} nm', fontsize=14)
+            plt.title(f'Resonance Spectrum: L_bar {p["L_bar"]} nm, L_tip {p["L_tip"]} nm, width {p["W"]} nm, res {config.resolution}', fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.7)
             plt.legend(fontsize=12)
             plt.tight_layout()
 
-            plot_filename = os.path.join("results", f"spectrum_gap_{p['gap']}nm_Lbar_{p['L_bar']}nm_Ltip_{p['L_tip']}nm_W_{p['W']}nm_CHECK4.png")
+            plot_filename = os.path.join("results", f"spectrum_gap_{p['gap']}nm_Lbar_{p['L_bar']}nm_Ltip_{p['L_tip']}nm_W_{p['W']}nm_res_{config.resolution}.png")
             plt.savefig(plot_filename, dpi=300)
             plt.close()
             print(f"Zapisano wykres widma: {plot_filename}")
@@ -731,7 +731,7 @@ def splitbar_calculate_resonant_peaks():
     ]
 
     sweeps = [
-        {"name": "SplitBar", "gap": 20, "L": 1800, "W": 240},
+        {"name": "SplitBar", "gap": 20, "L": 1800, "W": 240, "res": 200},
     ]
 
     results_filename = "results/resonant_peaks_splitbar_summary.txt"
@@ -746,6 +746,9 @@ def splitbar_calculate_resonant_peaks():
         for p in sweeps:
             mp.print_messages = False
             print_task(1, f"Szukanie rezonansu (split-bar, podloze {sub_name}): {p['name']} L={p['L']} W={p['W']}")
+
+            # per-sweep resolution override (falls back to config.resolution)
+            config.resolution = p.get("res", config.resolution)
 
             L_arm = p["L"] / xm
             width = p["W"] / xm
@@ -872,6 +875,189 @@ def splitbar_calculate_resonant_peaks():
     if mp.am_master():
         print_task(5, f" Wyniki zapisano w {results_filename}")
     return 0
+
+def splitbar_AuTiSiO2_opt():
+    """
+    Steady-state |E|^2 enhancement maps for the SPLIT-BAR antenna at its
+    resonant wavelength - the split-bar counterpart of hybridbar_AuTiSiO2_opt()
+    / bowtie_AuTiSiO2_opt().
+
+    Wavelength per task must come from splitbar_calculate_resonant_peaks() so the
+    single-frequency DFT sits on the resonance. Split-bar has no tapered tip and
+    no fillet gap correction, so the gap is used verbatim; `radius` only rounds
+    the bar corners (same 5 nm as the other opt/showcase geometries). Substrate
+    is SiO2, matching the other two geometries for a like-for-like comparison.
+    """
+    config = SimulationConfig()
+    config.IMG_CLOSE = True
+
+    tasks = [
+        {"gap": 30, "L": 2550, "W": 200, "Wavelength": 9252.53},
+        # {"gap": 30, "L": 2150, "W": 200, "Wavelength": 8027.92},
+        # {"gap": 30, "L": 1750, "W": 200, "Wavelength": 6744.24},
+    ]
+
+    for p in tasks:
+
+        plt.close('all')
+
+        config.resolution = 350       # bump to 400 for the final showcase run
+        config.sim_time = 12000 / xm      # unused by DFT maps (kept for other utils)
+        config.sim_time_step = 50 / xm
+        config.lambda0 = p["Wavelength"] / xm
+        # moderate-bandwidth Gaussian pulse centred at the resonance; the
+        # spectral envelope cancels in the DFT ant/empty ratio, so this only
+        # sets the pulse duration (~10/fwidth), not the physics
+        config.frequency_width = config.frequency
+        gap = p["gap"]
+        L_arm = p["L"]/xm
+        width = p["W"]/xm
+        Th_Au = 30/xm
+        Th_Ti = 5/xm
+        Th_Sub = 100/xm
+        # split-bar has no tip, so no L_tip term (cf. hybridbar_AuTiSiO2_opt)
+        L_Sub = (p["gap"] + 2 * p["L"] + 400)/xm
+        W_Sub = (p["W"] + 400)/xm
+        radius = 5 /xm
+
+        SIM_NAME = f"SplitBar_gap_{gap}nm_L_{p['L']}nm_W_{p['W']}nm_AuTiSiO2_res{config.resolution}_lambda_{config.lambda0}"
+        config.path_to_save, config.animations_folder_path = create_directory(SIM_NAME)
+
+        # ====================================================
+
+        AuTop = SplitBar(
+            gap=gap/xm,
+            length=L_arm,
+            width=width,
+            thickness=Th_Au,
+            material=Au,
+            z_offset=0.0,
+            radius=radius
+        )
+        TiBetween = SplitBar(
+            gap=gap/xm,
+            length=L_arm,
+            width=width,
+            thickness=Th_Ti,
+            material=Ti,
+            z_offset=-(Th_Au + Th_Ti)/2.0,
+            radius=radius
+        )
+
+        substrate = mp.Block(
+                size=mp.Vector3(L_Sub, W_Sub, Th_Sub),
+                center=mp.Vector3(0, 0, -(Th_Au/2.0 + Th_Ti + Th_Sub/2.0)),
+                material=SiO2
+            )
+
+        geometry = AuTop.build_geometry() + TiBetween.build_geometry() + [substrate]
+
+        config.pad = 200/xm
+        config.pml = 500/xm
+        config.cell_size = [
+            L_Sub + 2*config.pad + 2*config.pml,   # x
+            W_Sub + 2*config.pad + 2*config.pml,   # y
+            Th_Sub + AuTop.thickness + TiBetween.thickness+ 2*config.pad + 2*config.pml    # z
+        ]
+        cell = make_cell(config=config)
+
+        config.src_size = [
+            L_Sub,  # x
+            W_Sub,  # y
+            0.0 / xm    # z
+        ]
+        config.src_center = [
+            0.0,    # x
+            0.0,    # y
+            config.cell_size[2]/2.0-1.15*config.pml  # z
+        ]
+
+        config.nfreq = 500
+
+        antenna_vols = VolumeSetROI(cell, antenna=AuTop)
+
+        save_and_show_config(config, [AuTop, substrate])
+
+        sim = mp.Simulation(
+            cell_size=cell,
+            boundary_layers=[mp.PML(config.pml)],
+            geometry=geometry,
+            sources=make_source(config),
+            resolution = config.resolution,
+            k_point = mp.Vector3(),
+            symmetries=config.symmetries,
+            dimensions=3
+            )
+        sim_empty = mp.Simulation(
+            cell_size=cell,
+            boundary_layers=[mp.PML(config.pml)],
+            geometry=[],
+            sources=make_source(config),
+            resolution = config.resolution,
+            k_point = mp.Vector3(),
+            symmetries=config.symmetries,
+            dimensions=3
+            )
+
+        print("Antenna bounding box:", np.array(AuTop.bounding_box())*1000, "\n")
+
+        # =====================================================
+        print_task(1, "2D projections.")
+        for plane in ["XY", "XZ", "YZ"]:
+            Name2D = f"antenna_vis_{plane}.png"
+            save_2D_plot(
+                sim,
+                antenna_vols.vis_volume[plane],
+                save_name=Name2D,
+                path_to_save=config.path_to_save,
+                IMG_CLOSE=config.IMG_CLOSE
+            )
+        print_task(2, "2D projections.")
+        for plane in ["XY", "XZ", "YZ"]:
+            Name2D = f"antenna_roi_{plane}.png"
+            save_2D_plot(
+                sim,
+                antenna_vols.volume[plane],
+                save_name=Name2D,
+                path_to_save=config.path_to_save,
+                IMG_CLOSE=config.IMG_CLOSE
+            )
+        # =====================================================
+        print_task(3, "3D calculations - DFT enhancement maps at resonance.")
+        # steady-state |E|^2 enhancement maps at lambda0, directly comparable
+        # with the FEF values from splitbar_calculate_resonant_peaks()
+        max_enh = compute_dft_enhancement_maps(
+            sim,
+            sim_empty,
+            antenna_vols,
+            config,
+            decay_tol=DFT_DECAY_TOL,
+            max_run_time=DFT_MAX_RUN_TIME,
+        )
+
+        if mp.am_master() and max_enh:
+            summary_path = os.path.join("results", "DFT_enhancement_summary.txt")
+            write_header = not os.path.exists(summary_path)
+            with open(summary_path, "a") as f:
+                if write_header:
+                    f.write("SIM_NAME\tWavelength[nm]\t" + "\t".join(max_enh.keys()) + "\n")
+                f.write(SIM_NAME + f"\t{p['Wavelength']:.2f}\t"
+                        + "\t".join(f"{v:.3f}" for v in max_enh.values()) + "\n")
+
+        sim.reset_meep()
+        sim_empty.reset_meep()
+
+        del sim
+        del sim_empty
+
+        import gc
+        gc.collect()
+
+        if mp.am_master():
+            print("Pamięć zresetowana. Przechodzę do kolejnej anteny.")
+
+    return 0
+
 
 def hybridbar_AuTiSiO2_opt():
 
@@ -1102,7 +1288,7 @@ def bowtie_calculate_resonant_peaks():
         # {"name": "BowTie4", "gap": 70, "L": 500, "W": 300},
         # {"name": "BowTie4", "gap": 90, "L": 500, "W": 300},
         # {"name": "BowTie4", "gap": 10, "L": 500, "W": 300},
-        {"name": "BowTie4", "gap": 30, "L": 1000, "W": 1000},
+        {"name": "BowTie4", "gap": 30, "L": 1000, "W": 1000, "res": 200},
 
     ]
 
@@ -1115,8 +1301,11 @@ def bowtie_calculate_resonant_peaks():
     freqs = np.linspace(fcen - df/2.0, fcen + df/2.0, nfreq)
 
     for params in sweeps:
-        mp.print_messages = False 
+        mp.print_messages = False
         print_task(1, f"Szukanie rezonansu dla: {params['name']}")
+
+        # per-sweep resolution override (falls back to config.resolution)
+        config.resolution = params.get("res", config.resolution)
 
         L_tri = params["L"] / xm
         width = params["W"] / xm
